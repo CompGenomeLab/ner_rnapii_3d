@@ -1,0 +1,752 @@
+"""RNA polymerase II agent on the 1D loop-extrusion lattice.
+
+Two translocate plugins live here:
+
+* :func:`translocate_rnapii` — single-state RNAPII that walks at a fixed
+  integer ``rnapii_stride`` per tick (v1, kept for backwards compatibility).
+* :func:`stateful_translocate_rnapii` — three-state biological model
+  (PRE-INITIATION -> PAUSED -> ELONGATING) with per-state stochastic step
+  probability and optional enhancer-dependent pause release. The 1D
+  enhancer-promoter contact is detected by :func:`compute_ep_contacts`
+  using a cohesin-loop-containment proxy.
+
+Lattice encoding (``occupied``)::
+
+    0 = free
+    1 = cohesin leg
+    2 = RNAPII body
+
+RNAPII state codes (stored in ``RNAPII.state`` and the optional
+``rnapii_states`` HDF5 dataset)::
+
+    0 = PRE-INITIATION       (bound at TSS, not yet initiated)
+    1 = PAUSED       (initiated, promoter-proximal pause)
+    2 = ELONGATING   (productive elongation)
+    3 = TERMINATING  (reached TES, dwelling there before unloading)
+    4 = STALLED      (in the gene body, attempted a step but physically blocked
+                      this tick -- cohesin / traffic / lesion; NOT promoter-
+                      proximal pause and NOT productive elongation)
+
+PRE-INITIATION, PAUSED, STALLED and TERMINATING Pol II are stationary blocks to
+cohesin; only ELONGATING Pol II can push it (Fursova & Larson 2024, Fig 3a).
+"""
+
+from __future__ import annotations
+
+import bisect
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+
+from .lesions import lesion_blocks_rnapii
+
+FREE = 0
+COHESIN = 1
+RNAPII_CELL = 2
+
+STATE_PRE_INITIATION = 0
+STATE_PAUSED = 1
+STATE_ELONGATING = 2
+STATE_TERMINATING = 3
+STATE_STALLED = 4
+
+
+def _chain_length(args: Dict) -> int:
+    # chain_length is fixed for the whole run; memoise on the (persistent) args
+    # dict so the per-step hot path (``_valid_step`` -> ``_same_chain``) does one
+    # dict lookup instead of ``get`` + fallback + ``int`` every call. Same value.
+    cl = args.get("_chain_length_cache")
+    if cl is None:
+        cl = int(args.get("chain_length", args["N"]))
+        args["_chain_length_cache"] = cl
+    return cl
+
+
+def _same_chain(a: int, b: int, args: Dict) -> bool:
+    chain_length = _chain_length(args)
+    return int(a) // chain_length == int(b) // chain_length
+
+
+def _valid_step(pos: int, target: int, args: Dict) -> bool:
+    return 0 <= target < args["N"] and _same_chain(pos, target, args)
+
+
+@dataclass
+class Gene:
+    """A single transcription unit on the lattice."""
+
+    gene_id: int
+    tss: int
+    tes: int
+    direction: int                          # +1 (TSS<TES) or -1 (TSS>TES)
+    load_prob: float                        # per-tick recruitment to TSS
+    enhancer_pos: Optional[int] = None      # back-compat: primary (first) enhancer
+    # All enhancers regulating this gene (shadow / super-enhancer). One gene can
+    # integrate several, per ``enhancer_logic``. ``enhancer_pos`` mirrors the
+    # first entry for back-compat.
+    enhancers: Tuple[int, ...] = ()
+    # How simultaneous E-P contacts combine into transcriptional output:
+    #   "any"         -> redundancy: any one contact suffices (shadow enhancers)
+    #   "all"         -> obligate cooperativity: every enhancer must contact
+    #   "additive"    -> output scales with #contacts (DEFAULT; empirical baseline,
+    #                    Bothma/Levo eLife 2015; housekeeping enhancers eLife 2024)
+    #   "synergistic" -> super-additive output (#contacts ** enhancer_synergy;
+    #                    developmental enhancers)
+    enhancer_logic: str = "additive"
+    enhancer_synergy: float = 1.5           # exponent used iff logic == "synergistic"
+    requires_enhancer: bool = False
+    load_requires_enhancer: bool = False    # recruitment also requires E-P contact
+    initiation_prob: float = 1.0            # PRE-INITIATION -> PAUSED per tick
+    pause_release_prob: float = 1.0         # PAUSED  -> ELONGATING per tick
+    # PAUSED -> promoter-proximal premature termination per tick (competes with release). <0 falls
+    # back to the global ``rnapii_pause_term_prob``. Per-gene so productive_fraction = k_release/
+    # (k_release+k_term) can be class-specific (housekeeping terminate less -> more productive).
+    pause_term_prob: float = -1.0
+    elongation_step_prob: float = 1.0       # per-tick step prob during ELONGATING
+    pause_offset: int = 0                   # PAUSED site = TSS + direction*pause_offset
+    termination_prob: float = 1.0           # TERMINATING -> unload per tick (1.0 = no dwell)
+    # 3' termination window length in sites (1 site = bp_per_site bp) DOWNSTREAM of the TES, into which a terminating
+    # Pol II walks before release (Schwalb 2016 TT-seq: TTSs in a window median ~3.3 kb past the pA
+    # site, up to >10 kb). 0 = legacy single-slot TES dwell. A positive window lets the Pol vacate
+    # the TES on its first step so following Pol can complete -> removes the single-slot 3'-end jam.
+    termination_window: int = 0
+    # Regulatory class tag (e.g. hk_const/hk_high/celltype/dev). Purely a label carried through to
+    # the trajectory for per-class QC; the dynamics never read it.
+    gene_class: str = ""
+
+    def __post_init__(self) -> None:
+        # Keep ``enhancers`` (canonical) and ``enhancer_pos`` (legacy single) in
+        # sync however the Gene was constructed.
+        if not self.enhancers and self.enhancer_pos is not None:
+            self.enhancers = (int(self.enhancer_pos),)
+        elif self.enhancers:
+            self.enhancers = tuple(int(e) for e in self.enhancers)
+            if self.enhancer_pos is None:
+                self.enhancer_pos = self.enhancers[0]
+
+
+class RNAPII:
+    """One translocating polymerase.
+
+    Per-Pol state is kept in ``__slots__`` fields (not a dict): ``state`` (the
+    5-state code, or ``None`` for the v1 single-state model = "always elongating")
+    and ``lesion_stalled``. Behaviour matches the former ``attrs`` dict whose
+    ``get("state")`` returned ``None`` when unset.
+    """
+
+    __slots__ = ("pos", "gene_id", "direction", "uid", "state", "lesion_stalled")
+
+    def __init__(self, pos: int, gene_id: int, direction: int, uid: int = -1):
+        self.pos = pos
+        self.gene_id = gene_id
+        self.direction = direction
+        self.uid = uid              # stable per-Pol identity for trajectory tracks
+        self.state = None           # None = v1 (elongating); the stateful loader sets 0..4
+        self.lesion_stalled = False
+
+
+# ---------------------------------------------------------------------------
+# Topology bookkeeping helpers
+# ---------------------------------------------------------------------------
+
+def build_genes(
+    gene_specs: List[dict],
+    *,
+    default_load_prob: float = 0.02,
+) -> List[Gene]:
+    """Materialise YAML gene specs into :class:`Gene` instances."""
+    genes: List[Gene] = []
+    for gid, spec in enumerate(gene_specs):
+        tss = int(spec["tss"])
+        tes = int(spec["tes"])
+        if tss == tes:
+            raise ValueError(f"Gene {gid}: TSS and TES must differ")
+        direction = 1 if tes > tss else -1
+        load_prob = float(spec.get("load_prob", default_load_prob))
+        # Accept a list under ``enhancers`` (multi-enhancer genes) or a single
+        # ``enhancer_pos`` (legacy). The list wins when both are present.
+        raw_enhancers = spec.get("enhancers")
+        if raw_enhancers is None:
+            ep = spec.get("enhancer_pos")
+            enhancers: Tuple[int, ...] = () if ep is None else (int(ep),)
+        else:
+            enhancers = tuple(int(e) for e in raw_enhancers)
+        requires_enhancer = bool(spec.get("requires_enhancer", False))
+        if requires_enhancer and not enhancers:
+            raise ValueError(
+                f"Gene {gid} requires_enhancer=True but no enhancers given"
+            )
+        logic = str(spec.get("enhancer_logic", "additive"))
+        if logic not in ("any", "all", "additive", "synergistic"):
+            raise ValueError(
+                f"Gene {gid} enhancer_logic={logic!r} not in "
+                "{'any','all','additive','synergistic'}"
+            )
+        genes.append(Gene(
+            gene_id=gid,
+            tss=tss,
+            tes=tes,
+            direction=direction,
+            load_prob=load_prob,
+            enhancer_pos=enhancers[0] if enhancers else None,
+            enhancers=enhancers,
+            enhancer_logic=logic,
+            enhancer_synergy=float(spec.get("enhancer_synergy", 1.5)),
+            requires_enhancer=requires_enhancer,
+            load_requires_enhancer=bool(spec.get("load_requires_enhancer", False)),
+            initiation_prob=float(spec.get("initiation_prob", 1.0)),
+            pause_release_prob=float(spec.get("pause_release_prob", 1.0)),
+            pause_term_prob=float(spec.get("pause_term_prob", -1.0)),
+            elongation_step_prob=float(spec.get("elongation_step_prob", 1.0)),
+            pause_offset=int(spec.get("pause_offset", 0)),
+            termination_prob=float(spec.get("termination_prob", 1.0)),
+            termination_window=int(spec.get("termination_window", 0)),
+            gene_class=str(spec.get("gene_class", "")),
+        ))
+    return genes
+
+
+# ---------------------------------------------------------------------------
+# E-P contact (1D loop-containment proxy)
+# ---------------------------------------------------------------------------
+
+def compute_ep_contacts(
+    cohesins,
+    genes: Iterable[Gene],
+    tolerance: int = 2,
+    chain_length: Optional[int] = None,
+) -> Dict[int, int]:
+    """Map each gene_id to HOW MANY of its enhancers are currently in E-P contact.
+
+    An enhancer is "in contact" with its promoter (TSS) when at least one
+    cohesin loop interval brackets the (TSS, enhancer) pair within ``tolerance``
+    sites. The tolerance compensates for cohesin legs that cannot sit exactly at
+    the TSS when a PRE-INITIATION/PAUSED RNAPII occupies that site -- the loop still
+    topologically encloses the EP pair when its endpoints are one or two sites
+    off the EP coordinates.
+
+    Only genes with >=1 enhancer in contact appear in the returned mapping, so
+    ``gene_id in result`` still tests "this gene has E-P contact" (a multi-
+    enhancer generalisation of the old set return). The count drives dosage in
+    :func:`enhancer_factor`. Genes with no enhancers are skipped.
+
+    ``chain_length`` buckets cohesin loops by chain (``pos // chain_length``) so
+    each gene is only tested against cohesins on its OWN chain. On the
+    concatenated replicate lattice a cohesin on another chain has a disjoint
+    coordinate range and can never bracket an EP pair, so this is an EXACT
+    optimisation -- byte-identical output, but O(genes x cohesins_per_chain)
+    instead of O(genes x cohesins_total) per tick (the cross-chain scan was the
+    only super-linear term in the 1D tick). ``None`` (single chain / tests) puts
+    every cohesin in one bucket, reproducing the old global scan exactly.
+    """
+    # Bucket cohesin loops by chain, then within each chain index them for
+    # O(log) interval-containment queries. An enhancer is "in contact" iff some
+    # loop has L <= lo and R >= hi. Sorting loops by L and carrying a running max
+    # of R answers that with one bisect: among loops with L <= lo (a prefix of
+    # the L-sorted list), is max R >= hi? Identical boolean to the old `any(...)`
+    # scan, but O(genes log cohesins) per tick instead of O(genes x cohesins).
+    by_chain: Dict[int, List[Tuple[int, int]]] = {}
+    for c in cohesins:
+        lo_c = min(c.left.pos, c.right.pos)
+        hi_c = max(c.left.pos, c.right.pos)
+        by_chain.setdefault(lo_c // chain_length if chain_length else 0, []).append(
+            (lo_c, hi_c)
+        )
+    indexed: Dict[int, Tuple[List[int], List[int]]] = {}
+    for key, loops in by_chain.items():
+        loops.sort()                              # by L, then R
+        ls = [L for L, _ in loops]
+        pmax_r: List[int] = []
+        run = -1
+        for _, R in loops:
+            if R > run:
+                run = R
+            pmax_r.append(run)
+        indexed[key] = (ls, pmax_r)
+
+    out: Dict[int, int] = {}
+    for g in genes:
+        if not g.enhancers:
+            continue
+        chain = indexed.get(g.tss // chain_length if chain_length else 0)
+        if chain is None:
+            continue
+        ls, pmax_r = chain
+        count = 0
+        for enhancer in g.enhancers:
+            lo = min(g.tss, enhancer) + tolerance
+            hi = max(g.tss, enhancer) - tolerance
+            idx = bisect.bisect_right(ls, lo)     # #loops with L <= lo
+            if idx and pmax_r[idx - 1] >= hi:
+                count += 1
+        if count:
+            out[g.gene_id] = count
+    return out
+
+
+def _contact_count(ep_contacts, gene_id: int) -> int:
+    """#enhancers in contact for ``gene_id``, tolerating a dict or a plain set.
+
+    ``compute_ep_contacts`` returns a count dict, but callers (and tests) may
+    still pass a bare set of gene_ids; for a set, membership counts as one.
+    """
+    if isinstance(ep_contacts, dict):
+        return int(ep_contacts.get(gene_id, 0))
+    return 1 if gene_id in ep_contacts else 0
+
+
+def enhancer_factor(gene: Gene, n_contacts: int) -> float:
+    """Transcriptional-output multiplier from #enhancers in contact.
+
+    Returns 0.0 when the enhancer requirement is unmet (gate closed). For a
+    single-enhancer gene this is always 0.0 / 1.0 -- identical to the old
+    boolean behaviour -- regardless of ``enhancer_logic``. Multi-enhancer genes:
+
+      * ``any``         -> 1.0 if >=1 contact (redundant shadow enhancers)
+      * ``all``         -> 1.0 only if every enhancer is in contact
+      * ``additive``    -> min(n_contacts, k): linear dosage (DEFAULT)
+      * ``synergistic`` -> n_contacts ** enhancer_synergy: super-additive
+    """
+    k = len(gene.enhancers)
+    if k == 0:
+        return 1.0
+    logic = gene.enhancer_logic
+    if logic == "all":
+        return 1.0 if n_contacts >= k else 0.0
+    if n_contacts <= 0:
+        return 0.0
+    if logic == "any":
+        return 1.0
+    if logic == "synergistic":
+        return float(n_contacts) ** float(gene.enhancer_synergy)
+    return float(min(n_contacts, k))   # additive
+
+
+# ---------------------------------------------------------------------------
+# Dynamics
+# ---------------------------------------------------------------------------
+
+def load_rnapii(rnapiis: List[RNAPII], occupied: np.ndarray, args: Dict) -> None:
+    """For each gene, stochastically spawn a new RNAPII at its TSS.
+
+    New RNAPIIs start in the PRE-INITIATION state.
+    """
+    genes: List[Gene] = args["genes"]
+    rnapii_by_pos: Dict[int, RNAPII] = args["rnapii_by_pos"]
+    ep_contacts = args.get("current_ep_contacts", set())
+    # Pause-initiation limit (promoter-proximal occlusion): when enabled, a paused/
+    # pre-initiation Pol anywhere in the window [TSS .. TSS+dir*pause_offset] blocks
+    # a new initiation (Gressel 2019; Bartman 2019). Mirrors kernel _promoter_occluded.
+    occl = bool(args.get("rnapii_promoter_occlusion", True))
+    N = occupied.shape[0]
+    for gene in genes:
+        load_prob = gene.load_prob
+        if gene.load_requires_enhancer:
+            factor = enhancer_factor(gene, _contact_count(ep_contacts, gene.gene_id))
+            if factor <= 0.0:
+                continue
+            load_prob = min(1.0, gene.load_prob * factor)
+        if np.random.random() >= load_prob:
+            continue
+        if occupied[gene.tss] != FREE:
+            continue
+        if occl:
+            occluded = False
+            for s in range(1, gene.pause_offset + 1):
+                site = gene.tss + gene.direction * s
+                if site < 0 or site >= N:
+                    break
+                if occupied[site] == RNAPII_CELL:
+                    occluded = True
+                    break
+            if occluded:
+                continue
+        uid = int(args.get("_rnapii_uid_next", 0))
+        args["_rnapii_uid_next"] = uid + 1
+        r = RNAPII(pos=gene.tss, gene_id=gene.gene_id, direction=gene.direction, uid=uid)
+        r.state = STATE_PRE_INITIATION
+        occupied[gene.tss] = RNAPII_CELL
+        rnapii_by_pos[gene.tss] = r
+        rnapiis.append(r)
+
+
+def _resolve_head_on(r: "RNAPII", leg, args: Dict) -> str:
+    """Resolve an RNAPII stepping into a cohesin leg.
+
+    Returns ``"stall"`` (RNAPII blocked, stays put) or ``"push"`` (RNAPII
+    advances, displacing the cohesin leg).
+
+    Biology (Fursova & Larson, *Curr. Opin. Struct. Biol.* 2024, Fig. 3a):
+
+    * Only ELONGATING RNAPII translocates productively, so only it can
+      push a cohesin. PRE-INITIATION / PAUSED RNAPII is a stationary block and
+      always stalls on contact -- it never displaces cohesin.
+    * An elongating RNAPII pushes a *co-directional* cohesin leg (rear
+      encounter) far more readily than a *head-on* (converging) leg, which
+      tends to stall or slow the polymerase.
+
+    Backwards-compatible defaults: a v1 single-state RNAPII carries no
+    ``state`` attr and is treated as always-elongating; a leg with no
+    recorded ``dir`` is treated as co-directional.
+    """
+    state = r.state
+    if state is not None and state != STATE_ELONGATING:
+        return "stall"
+
+    # Intrinsic stall floor (Pol II pausing/slowing on any obstacle),
+    # applied regardless of orientation.
+    if np.random.random() < float(args.get("rnapii_stall_prob", 0.0)):
+        return "stall"
+
+    leg_dir = leg.dir if leg is not None else None
+    head_on = leg_dir is not None and leg_dir == -r.direction
+    push_p = float(args.get(
+        "rnapii_headon_push_prob" if head_on else "rnapii_push_prob", 0.0
+    ))
+    return "push" if np.random.random() < push_p else "stall"
+
+
+def _try_single_step(r: RNAPII, gene: Gene, occupied: np.ndarray, args: Dict) -> bool:
+    """Attempt a single +direction step. Returns True if the RNAPII advanced.
+
+    Handles all four target-cell cases (FREE / RNAPII / COHESIN / TES). On
+    a cohesin head-on encounter resolves stall / push / pass per
+    :func:`_resolve_head_on`. On TES arrival the RNAPII steps into the
+    TES slot even if a cohesin sits there (bypass slot).
+    """
+    # Reset first; set again below only if actually lesion-blocked this step, so
+    # the flag reflects the *current* obstacle (used for evict-on-repair).
+    r.lesion_stalled = False
+    rnapii_by_pos = args["rnapii_by_pos"]
+    target = r.pos + r.direction
+    if not _valid_step(r.pos, target, args):
+        return False
+
+    # A lesion blocks RNAPII per its type/state (Type A in pre-recognition, or
+    # any lesion under repair) -- the polymerase cannot transcribe through and
+    # stalls just upstream (lesion-stalled Pol II). A Type-B pre-recognition
+    # lesion is read through (lesion_blocks_rnapii is False).
+    lesions = args.get("lesions")
+    if lesions:
+        les = lesions.get(target)
+        if les is not None and lesion_blocks_rnapii(les):
+            r.lesion_stalled = True
+            return False
+
+    if target == gene.tes:
+        # TES is a normal occupiable slot: a terminating Pol II dwelling here must
+        # block cohesin (rnapii_terminating_block_prob) and exclude other Pol II.
+        # Stall if the slot is taken rather than stacking / erasing a marker.
+        if occupied[target] != FREE:
+            return False
+        rnapii_by_pos.pop(r.pos, None)
+        if occupied[r.pos] == RNAPII_CELL:
+            occupied[r.pos] = FREE
+        occupied[target] = RNAPII_CELL
+        r.pos = target
+        rnapii_by_pos[target] = r
+        return True
+
+    cell = occupied[target]
+
+    if cell == RNAPII_CELL:
+        return False
+
+    if cell == COHESIN:
+        # The grid may show COHESIN while an RNAPII is masked under a tunnelling
+        # cohesin (bypass). Never step onto a cell that still holds a Pol II.
+        if target in rnapii_by_pos:
+            return False
+        leg = args["cohesin_leg_by_pos"].get(target)
+        if _resolve_head_on(r, leg, args) == "stall":
+            return False
+        # push: displace the co-directional leg backward (in RNAPII's direction).
+        behind = target + r.direction
+        if not (_valid_step(target, behind, args) and occupied[behind] == FREE):
+            return False
+        occupied[behind] = COHESIN
+        occupied[target] = RNAPII_CELL
+        rnapii_by_pos.pop(r.pos, None)
+        if occupied[r.pos] == RNAPII_CELL:
+            occupied[r.pos] = FREE
+        args["cohesin_leg_by_pos"].pop(target, None)
+        if leg is not None:
+            leg.pos = behind
+            leg.pushed = True
+            # Pushed by elongating Pol II == transcription collision -> mark for
+            # Pol II-specific fast eviction (Busslinger 2017; Jeppsson 2022).
+            leg.rnapii_stalled = True
+            args["cohesin_leg_by_pos"][behind] = leg
+        r.pos = target
+        rnapii_by_pos[target] = r
+        return True
+
+    # cell == FREE
+    if occupied[r.pos] == RNAPII_CELL:
+        occupied[r.pos] = FREE
+    rnapii_by_pos.pop(r.pos, None)
+    occupied[target] = RNAPII_CELL
+    rnapii_by_pos[target] = r
+    r.pos = target
+    return True
+
+
+def _unload(r: RNAPII, occupied: np.ndarray, args: Dict) -> None:
+    """Remove an RNAPII from the lattice: free its cell (unless a tunnelling
+    cohesin masks it) and drop its ``rnapii_by_pos`` bookkeeping entry."""
+    if occupied[r.pos] == RNAPII_CELL:
+        occupied[r.pos] = FREE
+    args["rnapii_by_pos"].pop(r.pos, None)
+
+
+def _unload_at_tes(r: RNAPII, gene: Gene, occupied: np.ndarray, args: Dict) -> bool:
+    """If the RNAPII sits at its TES, clear it and return True."""
+    if r.pos != gene.tes:
+        return False
+    _unload(r, occupied, args)
+    return True
+
+
+def _evict_if_lesion_repaired(
+    r: RNAPII, occupied: np.ndarray, args: Dict, lesions: Dict
+) -> bool:
+    """Evict (not resume) an RNAPII that was stalled by a lesion which has since
+    been repaired. Returns True if the RNAPII was removed from the lattice.
+
+    The polymerase stalled one step upstream of the damage, so its blocking
+    lesion sat at ``r.pos + r.direction``; if that site no longer carries a
+    lesion, the damage was repaired and the lesion-stalled Pol II is evicted.
+    """
+    if not r.lesion_stalled:
+        return False
+    if (r.pos + r.direction) in lesions:
+        return False
+    _unload(r, occupied, args)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# v1: single-state translocate (kept for back-compat)
+# ---------------------------------------------------------------------------
+
+def translocate_rnapii(
+    rnapiis: List[RNAPII],
+    cohesins,                # unused but kept for symmetry with v2
+    occupied: np.ndarray,
+    args: Dict,
+) -> None:
+    """v1 RNAPII dynamics: single state, integer stride per tick."""
+    genes: List[Gene] = args["genes"]
+    stride: int = int(args.get("rnapii_stride", 1))
+    lesions = args.get("lesions") or {}
+
+    for idx in range(len(rnapiis) - 1, -1, -1):
+        r = rnapiis[idx]
+        gene = genes[r.gene_id]
+        if _evict_if_lesion_repaired(r, occupied, args, lesions):
+            del rnapiis[idx]
+            continue
+        if _unload_at_tes(r, gene, occupied, args):
+            del rnapiis[idx]
+            continue
+        for _ in range(stride):
+            if not _try_single_step(r, gene, occupied, args):
+                break
+
+
+# ---------------------------------------------------------------------------
+# v2: biological state machine (PRE-INITIATION / PAUSED / ELONGATING)
+# ---------------------------------------------------------------------------
+
+def stateful_translocate_rnapii(
+    rnapiis: List[RNAPII],
+    cohesins,
+    occupied: np.ndarray,
+    args: Dict,
+) -> None:
+    """v2 RNAPII dynamics with PRE-INITIATION/PAUSED/ELONGATING/TERMINATING states.
+
+    Per tick (per RNAPII):
+
+    * **At TES**: enter TERMINATING and dwell there as a stationary block
+      (Fursova & Larson 2024, Fig 3a: terminating Pol II blocks cohesin,
+      giving TES accumulation). Unload with probability
+      ``gene.termination_prob`` (``1.0`` = old one-tick behaviour).
+    * **PRE-INITIATION**: with probability ``gene.initiation_prob`` transition to
+      PAUSED; if ``gene.pause_offset > 0`` and the pause site is free,
+      hop there. Otherwise PAUSE in place.
+    * **PAUSED**: if the gene requires enhancer contact and the gene is
+      not currently in E-P contact (loop-containment proxy), stay PAUSED.
+      Otherwise transition to ELONGATING with probability
+      ``gene.pause_release_prob``. On transition, fall through to one
+      elongation step in the same tick.
+
+      Cohesin gatekeeper (Tei et al. 2026): a cohesin leg physically
+      associated within ``rnapii_pause_restraint_window`` sites of the
+      paused Pol II RESTRAINS (delays) pause release, multiplying the
+      release probability by ``rnapii_pause_cohesin_restraint`` (<1). This
+      is the second, opposing cohesin arm to E-P-mediated activation: on
+      cohesin loss the restraint is relieved (faster release), which
+      compensates for reduced recruitment and keeps steady-state output
+      roughly constant (the cohesin-loss paradox). Default ``1.0`` = off.
+
+      Promoter-proximal PREMATURE TERMINATION (competing kinetic channel):
+      a paused Pol II leaves the pause by one of two COMPETING channels --
+      productive release (per-gene ``gene.pause_release_prob`` = k_release) or
+      premature termination (global ``rnapii_pause_term_prob`` = k_termination).
+      Each tick, termination is tried first (unload, no transcript), then
+      release. The SINGLE-polymerase pause dwell is therefore
+      ``tau = dt / (k_release + k_termination)`` -- SHORT (~0.4 min; Lysakovskaia
+      et al. 2025; ~16.6 s median half-life, 2026 PRO-seq) because termination is
+      fast -- and the productive fraction is
+      ``k_release / (k_release + k_termination)`` (~0.1-0.25; activity-dependent,
+      since active genes have a higher k_release -> lower termination). The
+      minutes-scale "apparent" pause duration (Gressel et al. 2019; Jonkers 2014)
+      is NOT a single-Pol dwell: it is occupancy/output (pause occupancy divided
+      by PRODUCTIVE initiation) and is inflated ~1/productive_fraction-fold by the
+      terminated polymerases dropped from the output denominator -- the metrics
+      report it separately. Default ``rnapii_pause_term_prob = 0.0`` = off (every
+      paused Pol II eventually releases productively, the legacy behaviour).
+    * **ELONGATING**: attempt up to ``rnapii_stride`` ``+direction`` steps,
+      each with probability ``gene.elongation_step_prob``.
+    """
+    genes: List[Gene] = args["genes"]
+    # lef.run already computed EP contacts for this exact (cohesins, genes) state
+    # this tick and cached them under "current_ep_contacts" -- reuse rather than
+    # repeat the identical scan. Fall back to computing when called standalone.
+    ep_contacts = args.get("current_ep_contacts")
+    if ep_contacts is None:
+        tol = int(args.get("ep_contact_tolerance",
+                           max(1, round(2000 / int(args.get("bp_per_site", 250))))))
+        ep_contacts = compute_ep_contacts(
+            cohesins, genes, tolerance=tol, chain_length=_chain_length(args)
+        )
+
+    # Premature-termination at the promoter-proximal pause: a per-tick channel
+    # that competes with productive release (gene.pause_release_prob).
+    pause_term_prob = float(args.get("rnapii_pause_term_prob", 0.0))
+
+    # Tei 2026 gatekeeper: precompute cohesin leg positions once per tick so the
+    # PAUSED branch can detect a cohesin physically associated with the paused
+    # Pol II and restrain its release. Skipped entirely when restraint is off.
+    restraint = float(args.get("rnapii_pause_cohesin_restraint", 1.0))
+    restraint_window = int(args.get("rnapii_pause_restraint_window", 1))
+    leg_positions: Optional[np.ndarray] = None
+    if restraint < 1.0:
+        legs = [c.left.pos for c in cohesins] + [c.right.pos for c in cohesins]
+        leg_positions = np.array(legs, dtype=np.int64) if legs else None
+
+    lesions = args.get("lesions") or {}
+
+    # Decelerated per-tick step probability for a Pol walking the 3' termination window
+    # (Cortazar 2019: 3' elongation slows to ~0.7-0.9 kb/min). 1.0 -> the Pol always tries
+    # to advance through the window; used only when a gene has termination_window > 0.
+    term_step_prob = float(args.get("rnapii_termination_step_prob", 1.0))
+
+    for idx in range(len(rnapiis) - 1, -1, -1):
+        r = rnapiis[idx]
+        gene = genes[r.gene_id]
+
+        # A Pol II stalled by a lesion that has since been repaired is evicted,
+        # not resumed (lesions update before this phase, so the site is free now).
+        if _evict_if_lesion_repaired(r, occupied, args, lesions):
+            del rnapiis[idx]
+            continue
+
+        # At or PAST the TES: the Pol is TERMINATING. With a 3' termination window it walks
+        # downstream through the window (Schwalb 2016: median ~3.3 kb past the pA site, up to
+        # >10 kb) at the decelerated term_step_prob, releasing stochastically (termination_prob)
+        # or on reaching the ultimate TTS (window end). Because it VACATES the TES on its first
+        # window step, following Pol can complete -- this removes the single-slot 3'-end jam that
+        # otherwise caps gene output at 1/dwell and packs long active gene bodies solid.
+        past_tes = (r.pos - gene.tes) * gene.direction
+        if past_tes >= 0:
+            r.state = STATE_TERMINATING
+            win = gene.termination_window
+            if win <= 0:
+                # Legacy single-slot TES dwell (no window).
+                if np.random.random() < gene.termination_prob:
+                    _unload(r, occupied, args)
+                    del rnapiis[idx]
+                continue
+            # Release at the ultimate TTS (window end) or stochastically along the window.
+            if past_tes >= win or np.random.random() < gene.termination_prob:
+                _unload(r, occupied, args)
+                del rnapiis[idx]
+                continue
+            # Otherwise crawl one site further downstream into the window (decelerated).
+            if term_step_prob >= 1.0 or np.random.random() < term_step_prob:
+                _try_single_step(r, gene, occupied, args)
+            continue
+
+        state = r.state if r.state is not None else STATE_PRE_INITIATION
+
+        if state == STATE_PRE_INITIATION:
+            if np.random.random() < gene.initiation_prob:
+                # Hop up to pause_offset sites toward the pause site; stop early
+                # if blocked. pause_offset is a distance, not a flag.
+                for _ in range(gene.pause_offset):
+                    if not _try_single_step(r, gene, occupied, args):
+                        break
+                r.state = STATE_PAUSED
+            continue
+
+        if state == STATE_PAUSED:
+            # Premature termination competes with productive release (tried first
+            # each tick, regardless of the enhancer gate): the paused Pol II
+            # unloads without a transcript. With release rate k_release and
+            # termination rate k_termination, the single-Pol dwell is
+            # dt/(k_release+k_termination) (short) and the productive fraction is
+            # k_release/(k_release+k_termination).
+            g_pause_term = (gene.pause_term_prob if gene.pause_term_prob >= 0.0
+                            else pause_term_prob)
+            if g_pause_term > 0.0 and np.random.random() < g_pause_term:
+                _unload(r, occupied, args)
+                del rnapiis[idx]
+                args["_rnapii_premature_count"] = (
+                    int(args.get("_rnapii_premature_count", 0)) + 1
+                )
+                continue
+            release_prob = gene.pause_release_prob
+            if gene.requires_enhancer:
+                factor = enhancer_factor(
+                    gene, _contact_count(ep_contacts, gene.gene_id)
+                )
+                if factor <= 0.0:
+                    continue                       # gate closed: stay PAUSED
+                release_prob = min(1.0, gene.pause_release_prob * factor)
+            if leg_positions is not None and np.any(
+                np.abs(leg_positions - r.pos) <= restraint_window
+            ):
+                release_prob *= restraint           # cohesin restrains release
+            if np.random.random() >= release_prob:
+                continue
+            r.state = STATE_ELONGATING
+            # fall through to elongation; the first step out of the pause is forced
+            # (see `just_released` below) so the pause site frees THIS tick.
+
+        # state == STATE_ELONGATING / STATE_STALLED (entering or carried over).
+        # A failed speed roll means slow but productive elongation; a failed
+        # physical move means a real obstacle stall.
+        #
+        # NON-BLOCKING RELEASE: on the tick a Pol leaves the pause (the local
+        # `state` is still PAUSED here, while r.state is now ELONGATING),
+        # its FIRST step is taken WITHOUT an elongation-speed roll, so it vacates
+        # the pause site immediately instead of lingering there ~1/elongation_step_prob
+        # ticks and throttling the next initiation. Steric exclusion still applies
+        # (a Pol cannot step onto an occupied site), so a congested body can still
+        # stall it -- relieving that is the separate gene-body-capacity change.
+        just_released = (state == STATE_PAUSED)
+        stride = max(1, int(args.get("rnapii_stride", 1)))
+        stalled = False
+        for i in range(stride):
+            forced = just_released and i == 0
+            if not forced and np.random.random() >= gene.elongation_step_prob:
+                continue
+            if not _try_single_step(r, gene, occupied, args):
+                stalled = True
+                break
+            if r.pos == gene.tes:
+                break
+        r.state = STATE_STALLED if stalled else STATE_ELONGATING

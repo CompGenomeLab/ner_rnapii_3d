@@ -1,0 +1,126 @@
+"""Lightweight progress + ETA logging for the 1D engine.
+
+The engine logs through the ``ner_rnapii_3d`` logger; configure the root logger
+to INFO to see progress (it is silent by default unless handlers are attached).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Callable, Optional
+
+log = logging.getLogger("ner_rnapii_3d")
+
+
+def fmt_hms(seconds: float) -> str:
+    """Format a duration as ``H:MM:SS`` (or ``M:SS``); ``?`` for NaN/negative."""
+    if seconds != seconds or seconds < 0:        # NaN or negative
+        return "?"
+    s = int(round(seconds))
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:d}:{sec:02d}"
+
+
+class ProgressMeter:
+    """Throttled ``[stage] i/total (pct) elapsed=.. ETA=.. rate`` logger.
+
+    Call :meth:`update` every iteration (cheap); output is rate-limited to one
+    line per ``min_interval`` seconds, plus a guaranteed final line.
+    """
+
+    def __init__(self, total: int, stage: str, *, min_interval: float = 2.0):
+        self.total = max(1, int(total))
+        self.stage = stage
+        self.min_interval = float(min_interval)
+        self._start = time.time()
+        self._last = 0.0
+        # Rate baseline -- set on the FIRST update(), not at construction, so any
+        # one-time setup before the first measured iteration (buffer allocation,
+        # lazy imports, warmup) is excluded from the rate. Otherwise the early
+        # rate is optimistic and the ETA *climbs* as the estimate corrects.
+        self._base_t: Optional[float] = None
+        self._base_n = 0
+        self.n = 0
+
+    def start(self) -> None:
+        """Reset the clock to *now*.
+
+        Call once, right before the first measured iteration, so one-time setup
+        done after construction (energy minimization, relaxation, burn-in) is
+        excluded from the rate/ETA estimate. The rate baseline also re-arms on
+        the next update().
+        """
+        self._start = time.time()
+        self._last = 0.0
+        self._base_t = None
+        self._base_n = self.n
+
+    def update(self, n: Optional[int] = None, extra: str = "") -> None:
+        self.n = self.n + 1 if n is None else int(n)
+        now = time.time()
+        if self._base_t is None:                 # first measured iteration
+            self._base_t = now
+            self._base_n = self.n
+        if self.n < self.total and (now - self._last) < self.min_interval:
+            return
+        self._last = now
+        el = now - self._start
+        # Rate is measured from the first update() (steady-state work), not from
+        # construction, so the ETA reflects the real iteration cost -- including
+        # periodic costs (e.g. chunked H5 writes) once they fall inside the
+        # window -- instead of a too-fast startup sample. Shows "?" until there
+        # is a real interval to measure (first line, where d_t == 0).
+        d_n = self.n - self._base_n
+        d_t = now - self._base_t
+        rate = d_n / d_t if d_t > 0 else 0.0
+        eta = (self.total - self.n) / rate if rate > 0 else float("nan")
+        if rate <= 0:
+            rate_str = "?/s"
+        elif rate >= 1:
+            rate_str = f"{rate:.0f}/s"
+        else:
+            rate_str = f"{rate * 60:.1f}/min"
+        log.info(
+            "[%s] %d/%d (%.1f%%) elapsed=%s ETA=%s %s%s",
+            self.stage, self.n, self.total, 100.0 * self.n / self.total,
+            fmt_hms(el), fmt_hms(eta), rate_str,
+            (" " + extra) if extra else "",
+        )
+
+    def done(self, extra: str = "") -> None:
+        el = time.time() - self._start
+        log.info("[%s] done in %s%s", self.stage, fmt_hms(el),
+                 (" " + extra) if extra else "")
+
+
+def stepped_run(
+    step_fn: Callable[[int], object],
+    total_steps: int,
+    stage: str,
+    *,
+    chunks: int = 50,
+    min_interval: float = 2.0,
+) -> None:
+    """Run a long integrator burn-in in chunks, logging ETA between them.
+
+    ``step_fn(n)`` advances ``n`` steps (e.g. ``sim.integrator.step``). Splits
+    ``total_steps`` into ~``chunks`` pieces so silent multi-million-step
+    relaxations report progress instead of hanging quietly. An immediate
+    ``0/total`` line is logged up front so the meter's presence is visible
+    before the first chunk (which carries the first ETA) finishes.
+    """
+    total = int(total_steps)
+    if total <= 0:
+        return
+    log.info("[%s] 0/%d (0.0%%) running... (first ETA after 1 chunk)", stage, total)
+    chunk = max(1, total // max(1, chunks))
+    meter = ProgressMeter(total, stage, min_interval=min_interval)
+    done = 0
+    while done < total:
+        n = min(chunk, total - done)
+        step_fn(n)
+        done += n
+        meter.update(done)
+    meter.done()
