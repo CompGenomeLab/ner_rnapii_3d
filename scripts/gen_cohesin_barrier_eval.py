@@ -85,6 +85,9 @@ def read_cohesin_occupancy(h5_path: Path, chunk: int = 2000):
         genes = h["genes"][:] if "genes" in h else None
         ds = h["positions"]                       # (T, n_lefs, 2) = [left, right] leg sites
         T = int(ds.shape[0])
+        if T == 0:
+            raise ValueError(f"{h5_path}: cohesin occupancy requires at least one frame")
+        chunk = min(max(1, int(chunk)), max(1, 2_000_000 // max(int(ds.shape[1]), 1)))
         occ = np.zeros(N, dtype=np.float64)
         for start in range(0, T, chunk):
             legs = ds[start:min(start + chunk, T)].reshape(-1)
@@ -106,6 +109,9 @@ def read_pol_occupancy_per_gene(h5_path: Path, genes, chunk: int = 2000):
             return None
         ds = h["rnapii_positions"]                # (T, R, 2) = [site, gene_id]
         T = int(ds.shape[0])
+        if T == 0:
+            raise ValueError(f"{h5_path}: Pol II occupancy requires at least one frame")
+        chunk = min(max(1, int(chunk)), max(1, 2_000_000 // max(int(ds.shape[1]), 1)))
         occ = np.zeros(len(gids), dtype=np.float64)
         for start in range(0, T, chunk):
             block = ds[start:min(start + chunk, T)]
@@ -293,7 +299,7 @@ def plot_metagene(x_tss, x_tes, xs_scaled, on, off, flank, out_path, *, title, b
              "(1.0 = genome average; dashed line). Curves averaged over all genes, oriented 5′→3′.",
              ha="center", fontsize=9.5, style="italic", color="#555")
     fig.tight_layout(rect=(0, 0.03, 1, 0.96))
-    fig.savefig(out_path, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(out_path, bbox_inches="tight"); fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight"); plt.close(fig)
 
 
 def plot_activity(xs_scaled, active_prof, silent_prof, pol_occ, body_e, out_path, *,
@@ -325,7 +331,7 @@ def plot_activity(xs_scaled, active_prof, silent_prof, pol_occ, body_e, out_path
     a2.tick_params(labelsize=9.5)
     fig.suptitle(title, fontsize=14.5, y=1.0)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(out_path, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(out_path, bbox_inches="tight"); fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight"); plt.close(fig)
 
 
 def _profiles(occ, genes, genome_mean, N, chain, *, flank, nbody, gene_mask=None):

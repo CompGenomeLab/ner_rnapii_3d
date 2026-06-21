@@ -232,6 +232,49 @@ def test_positive_scale_passes_validation(tmp_path):
     assert cfg.tick_seconds == 0.25
 
 
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("chain_length", 0, "chain_length must be > 0"),
+        ("num_chains", 0, "num_chains must be > 0"),
+        ("separation", 0, "separation must be > 0"),
+        ("lifetime", 0, "lifetime must be > 0"),
+        ("lifetime_stalled", -1, "lifetime_stalled must be > 0"),
+        ("warmup_steps", -1, "warmup_steps must be >= 0"),
+        ("trajectory_length", -1, "trajectory_length must be >= 0"),
+        ("max_rnapii", -1, "max_rnapii must be >= 0"),
+    ],
+)
+def test_core_size_and_time_fields_are_validated(tmp_path, field, value, match):
+    p = _write(tmp_path, f"bad_{field}.yaml", f"lef:\n  {field}: {value}\n")
+    with pytest.raises(ValueError, match=match):
+        load_lef_config(p)
+
+
+def test_impossible_lef_density_is_rejected(tmp_path):
+    p = _write(
+        tmp_path,
+        "too_dense.yaml",
+        "lef:\n  chain_length: 3\n  num_chains: 1\n  separation: 1\n",
+    )
+    with pytest.raises(ValueError, match="can hold at most 1 adjacent pairs"):
+        load_lef_config(p)
+
+
+def test_incomplete_rnapii_plugin_pair_is_rejected(tmp_path):
+    p = _write(
+        tmp_path,
+        "half_rnapii.yaml",
+        """
+lef:
+  plugins:
+    rnapii_load: ner_rnapii_3d.plugins.rnapii:load_rnapii
+""",
+    )
+    with pytest.raises(ValueError, match="must either both be set"):
+        load_lef_config(p)
+
+
 # --------------------------------------------------------------------------- #
 # load_config (.lef accessor)
 # --------------------------------------------------------------------------- #

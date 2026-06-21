@@ -18,8 +18,9 @@ If an H5 path is omitted, the script runs/reuses the 1D LEF stage at
 Statistics
 ----------
 For each metric the script tests config1 chains against config2 chains with a
-two-sided exact two-sample permutation test on raw per-chain values. This treats
-replicate chains as independent samples and does not assume normality.
+two-sided two-sample permutation test on raw per-chain values. It is exact through
+200,000 partitions and otherwise uses 200,000 deterministic Monte Carlo samples.
+This treats replicate chains as independent samples and does not assume normality.
 """
 from __future__ import annotations
 
@@ -70,15 +71,37 @@ BOUNDARY_LABELS = {
 }
 BOUNDARY_ORDER = list(BOUNDARY_LABELS)
 
-STAT_TEST_NAME = "two-sided exact two-sample permutation test on raw per-chain values"
+STAT_TEST_NAME = (
+    "two-sided two-sample permutation test on raw per-chain values "
+    "(exact through 200000 partitions; otherwise 200000 deterministic Monte Carlo samples)"
+)
 
 
 def _safe_mean(values: np.ndarray) -> float:
     return float(np.mean(values)) if values.size else float("nan")
 
 
-def _safe_percentile(values: np.ndarray, percentile: float) -> float:
-    return float(np.percentile(values, percentile)) if values.size else float("nan")
+def _hist_percentile(hist: np.ndarray, percentile: float) -> float:
+    """Linear percentile of an integer-valued sample represented by a histogram.
+
+    This is NumPy's default ``method="linear"`` calculation without expanding
+    every loop span into a trajectory-sized array. The interpolation branch is
+    intentionally the same as NumPy's private ``_lerp`` implementation.
+    """
+    n = int(hist.sum())
+    if n == 0:
+        return float("nan")
+    rank = (n - 1) * (float(percentile) / 100.0)
+    lower_rank = int(np.floor(rank))
+    upper_rank = int(np.ceil(rank))
+    cumulative = np.cumsum(hist)
+    lower = int(np.searchsorted(cumulative, lower_rank, side="right"))
+    upper = int(np.searchsorted(cumulative, upper_rank, side="right"))
+    gamma = rank - lower_rank
+    diff = upper - lower
+    if gamma >= 0.5:
+        return float(upper - diff * (1.0 - gamma))
+    return float(lower + diff * gamma)
 
 
 def _read_yaml(path: Path) -> dict:
@@ -364,7 +387,15 @@ def analyze_run(
     cfg_path: Path,
     h5_path: Path,
     topo: dict,
+    *,
+    positions: np.ndarray | None = None,
+    chunk: int = 2000,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Analyze one trajectory in memory-bounded blocks.
+
+    ``positions`` optionally accepts an existing array for callers/tests that
+    already own one; otherwise the HDF5 dataset is streamed directly.
+    """
     del cfg_path
     chain = topo["chain"]
     num_chains = topo["num_chains"]
@@ -375,105 +406,176 @@ def analyze_run(
     ctcf_mask = topo["ctcf_mask"]
     n_boundaries = max(topo["boundaries"], 1)
 
-    pos = _load_positions(h5_path)
-    frames, lefs, _ = pos.shape
+    if positions is not None:
+        if positions.ndim != 3 or positions.shape[2] != 2:
+            raise ValueError(f"positions must have shape (frames, lefs, 2), got {positions.shape}")
+        frames, lefs, _ = positions.shape
+        source = positions
+        h5 = None
+    else:
+        h5 = h5py.File(h5_path, "r")
+        if "positions" not in h5:
+            h5.close()
+            raise ValueError(f"{h5_path} has no 'positions' dataset")
+        source = h5["positions"]
+        frames, lefs, _ = source.shape
 
-    legs = pos.reshape(frames, lefs * 2)
-    leg_chain = legs // chain
-    leg_rel = legs % chain
-
-    lo = np.minimum(pos[..., 0], pos[..., 1])
-    hi = np.maximum(pos[..., 0], pos[..., 1])
-    lo_chain = lo // chain
-    hi_chain = hi // chain
-    same_chain = lo_chain == hi_chain
-    lo_rel = lo % chain
-    hi_rel = hi % chain
-    span = hi_rel - lo_rel
-    lo_tad = np.searchsorted(edges, lo_rel, side="right") - 1
-    hi_tad = np.searchsorted(edges, hi_rel, side="right") - 1
-    cross_tad = same_chain & (lo_tad != hi_tad)
-    multi_tad = same_chain & (hi_tad > lo_tad + 1)
-    crossed_boundary_count = np.maximum(0, hi_tad - lo_tad) * same_chain
-
-    left_rel = pos[..., 0] % chain
-    right_rel = pos[..., 1] % chain
-    left_ctcf = ctcf_mask[left_rel]
-    right_ctcf = ctcf_mask[right_rel]
-    exactly_one_ctcf = same_chain & (left_ctcf ^ right_ctcf)
-    boundary_crossing_stripe = exactly_one_ctcf & cross_tad
-
-    # Corner dot: a single LEF whose lower leg sits on a TAD's left-facing anchor
-    # AND whose upper leg sits on the SAME TAD's right-facing anchor (both legs
-    # captured at the two convergent anchors of one internal TAD). corner_pairs
-    # already excludes chromosome-end anchors, so this is the internal-only dot.
-    corner_pairs = topo["corner_pairs"]
+    # Bound derived-array memory when LEFs scale up; this target is a maximum
+    # number of loop rows, not a model-size assumption. Integer accumulators and
+    # explicit cross-block step handling make the result chunk-invariant.
+    chunk = min(max(1, int(chunk)), max(1, 2_000_000 // max(lefs, 1)))
+    counts = {
+        name: np.zeros(num_chains, dtype=np.int64)
+        for name in (
+            "gene", "ctcf", "one_ctcf", "stripe", "cross_tad", "multi_tad",
+            "crossed_boundary", "corner", "pass", "moving",
+        )
+    }
+    span_hist = np.zeros((num_chains, chain), dtype=np.int64)
+    corner_keys = np.array(
+        [left * chain + right for left, right in topo["corner_pairs"].values()],
+        dtype=np.int64,
+    )
     n_tads_corner = max(topo["n_tads_corner"], 1)
-    corner_dot = np.zeros_like(same_chain, dtype=bool)
-    for left_site, right_site in corner_pairs.values():
-        corner_dot |= same_chain & (lo_rel == left_site) & (hi_rel == right_site)
+    boundary_mask = np.zeros(chain, dtype=bool)
+    boundary_mask[boundaries[(boundaries >= 0) & (boundaries < chain)]] = True
+    previous_frame = None
 
-    prev = pos[:-1]
-    curr = pos[1:]
+    def add_by_chain(name: str, chain_ids: np.ndarray) -> None:
+        if chain_ids.size:
+            counts[name] += np.bincount(chain_ids, minlength=num_chains)[:num_chains]
+
+    def accumulate_steps(before: np.ndarray, after: np.ndarray) -> None:
+        if before.shape[0] == 0:
+            return
+        for leg in (0, 1):
+            b = before[..., leg]
+            a = after[..., leg]
+            bc = b // chain
+            ac = a // chain
+            br = b % chain
+            ar = a % chain
+            real = (
+                (bc == ac) & (bc >= 0) & (bc < num_chains)
+                & (np.abs(ar - br) == 1)
+            )
+            add_by_chain("moving", bc[real])
+            step_lo = np.minimum(br, ar)
+            step_hi = np.maximum(br, ar)
+            passed = real & (step_lo == step_hi - 1) & boundary_mask[step_hi]
+            add_by_chain("pass", bc[passed])
+
+    try:
+        for start in range(0, frames, chunk):
+            end = min(start + chunk, frames)
+            pos = np.asarray(source[start:end])
+            if pos.shape[0] == 0:
+                continue
+
+            legs = pos.reshape(pos.shape[0], lefs * 2)
+            leg_chain = legs // chain
+            leg_rel = legs % chain
+            valid_leg_chain = (leg_chain >= 0) & (leg_chain < num_chains)
+            add_by_chain("gene", leg_chain[valid_leg_chain & gene_mask[leg_rel]])
+            add_by_chain("ctcf", leg_chain[valid_leg_chain & ctcf_mask[leg_rel]])
+
+            lo = np.minimum(pos[..., 0], pos[..., 1])
+            hi = np.maximum(pos[..., 0], pos[..., 1])
+            lo_chain = lo // chain
+            hi_chain = hi // chain
+            same_chain = (
+                (lo_chain == hi_chain) & (lo_chain >= 0) & (lo_chain < num_chains)
+            )
+            lo_rel = lo % chain
+            hi_rel = hi % chain
+            span = hi_rel - lo_rel
+            lo_tad = np.searchsorted(edges, lo_rel, side="right") - 1
+            hi_tad = np.searchsorted(edges, hi_rel, side="right") - 1
+            cross_tad = same_chain & (lo_tad != hi_tad)
+            multi_tad = same_chain & (hi_tad > lo_tad + 1)
+            crossed = np.maximum(0, hi_tad - lo_tad)
+
+            left_rel = pos[..., 0] % chain
+            right_rel = pos[..., 1] % chain
+            exactly_one = same_chain & (ctcf_mask[left_rel] ^ ctcf_mask[right_rel])
+            stripe = exactly_one & cross_tad
+            if corner_keys.size:
+                corner = same_chain & np.isin(lo_rel * chain + hi_rel, corner_keys)
+            else:
+                corner = np.zeros_like(same_chain)
+
+            add_by_chain("one_ctcf", lo_chain[exactly_one])
+            add_by_chain("stripe", lo_chain[stripe])
+            add_by_chain("cross_tad", lo_chain[cross_tad])
+            add_by_chain("multi_tad", lo_chain[multi_tad])
+            add_by_chain("corner", lo_chain[corner])
+            if same_chain.any():
+                counts["crossed_boundary"] += np.bincount(
+                    lo_chain[same_chain], weights=crossed[same_chain],
+                    minlength=num_chains,
+                )[:num_chains].astype(np.int64)
+                hist_key = lo_chain[same_chain] * chain + span[same_chain]
+                span_hist += np.bincount(
+                    hist_key, minlength=num_chains * chain
+                ).reshape(num_chains, chain)
+
+            if previous_frame is not None:
+                accumulate_steps(previous_frame[None, ...], pos[:1])
+            accumulate_steps(pos[:-1], pos[1:])
+            previous_frame = pos[-1].copy()
+    finally:
+        if h5 is not None:
+            h5.close()
 
     core_rows: list[dict] = []
     boundary_rows: list[dict] = []
     aux_rows: list[dict] = []
     length_rows: list[dict] = []
 
+    def ratio(numerator: int | float, denominator: int | float) -> float:
+        return numerator / denominator if denominator else float("nan")
+
     for chain_idx in range(num_chains):
-        chain_loops = same_chain & (lo_chain == chain_idx)
-        spans = span[chain_loops].astype(float)
-        n_spans = int(spans.size)
-        mean_span = _safe_mean(spans)
+        hist = span_hist[chain_idx]
+        n_spans = int(hist.sum())
+        span_total = sum(i * int(value) for i, value in enumerate(hist) if value)
+        mean_span = span_total / n_spans if n_spans else float("nan")
 
-        gene_hits = int(((leg_chain == chain_idx) & gene_mask[leg_rel]).sum())
-        ctcf_hits = int(((leg_chain == chain_idx) & ctcf_mask[leg_rel]).sum())
-        one_ctcf_count = int((exactly_one_ctcf & (lo_chain == chain_idx)).sum())
-        stripe_cross_count = int((boundary_crossing_stripe & (lo_chain == chain_idx)).sum())
-        cross_tad_count = int((cross_tad & (lo_chain == chain_idx)).sum())
-        multi_tad_count = int((multi_tad & (lo_chain == chain_idx)).sum())
-        crossed_boundary_total = int((crossed_boundary_count * (lo_chain == chain_idx)).sum())
-        corner_dot_count = int((corner_dot & (lo_chain == chain_idx)).sum())
-
-        pass_events = 0
-        moving_steps = 0
-        for leg in (0, 1):
-            before = prev[..., leg]
-            after = curr[..., leg]
-            in_chain = (before // chain == chain_idx) & (after // chain == chain_idx)
-            before_rel = before % chain
-            after_rel = after % chain
-            real_step = in_chain & (np.abs(after_rel - before_rel) == 1)
-            moving_steps += int(real_step.sum())
-            step_lo = np.minimum(before_rel, after_rel)
-            step_hi = np.maximum(before_rel, after_rel)
-            pass_events += int((np.isin(step_hi, boundaries) & (step_lo == step_hi - 1) & real_step).sum())
+        gene_hits = int(counts["gene"][chain_idx])
+        ctcf_hits = int(counts["ctcf"][chain_idx])
+        one_ctcf_count = int(counts["one_ctcf"][chain_idx])
+        stripe_cross_count = int(counts["stripe"][chain_idx])
+        cross_tad_count = int(counts["cross_tad"][chain_idx])
+        multi_tad_count = int(counts["multi_tad"][chain_idx])
+        crossed_boundary_total = int(counts["crossed_boundary"][chain_idx])
+        corner_dot_count = int(counts["corner"][chain_idx])
+        pass_events = int(counts["pass"][chain_idx])
+        moving_steps = int(counts["moving"][chain_idx])
 
         core_metrics = {
             "cohesin_gene_body": (
-                gene_hits / (frames * max(topo["gene_sites"], 1)),
+                ratio(gene_hits, frames * max(topo["gene_sites"], 1)),
                 gene_hits,
                 frames * max(topo["gene_sites"], 1),
             ),
             "cohesin_ctcf_boundary": (
-                ctcf_hits / (frames * max(topo["ctcf_sites"], 1)),
+                ratio(ctcf_hits, frames * max(topo["ctcf_sites"], 1)),
                 ctcf_hits,
                 frames * max(topo["ctcf_sites"], 1),
             ),
             "boundary_pass_event": (
-                pass_events / ((frames - 1) * n_boundaries),
+                ratio(pass_events, (frames - 1) * n_boundaries),
                 pass_events,
                 (frames - 1) * n_boundaries,
             ),
             "mean_loop_length": (mean_span * kb_per_site, n_spans, 1),
             "boundary_crossing_stripe": (
-                stripe_cross_count / (frames * n_boundaries),
+                ratio(stripe_cross_count, frames * n_boundaries),
                 stripe_cross_count,
                 frames * n_boundaries,
             ),
             "corner_dot": (
-                corner_dot_count / (frames * n_tads_corner),
+                ratio(corner_dot_count, frames * n_tads_corner),
                 corner_dot_count,
                 frames * n_tads_corner,
             ),
@@ -496,32 +598,32 @@ def analyze_run(
 
         boundary_metrics = {
             "boundary_pass_event": (
-                pass_events / ((frames - 1) * n_boundaries),
+                ratio(pass_events, (frames - 1) * n_boundaries),
                 pass_events,
                 (frames - 1) * n_boundaries,
             ),
             "cross_tad_occupancy": (
-                cross_tad_count / (frames * n_boundaries),
+                ratio(cross_tad_count, frames * n_boundaries),
                 cross_tad_count,
                 frames * n_boundaries,
             ),
             "crossed_boundaries": (
-                crossed_boundary_total / (frames * n_boundaries),
+                ratio(crossed_boundary_total, frames * n_boundaries),
                 crossed_boundary_total,
                 frames * n_boundaries,
             ),
             "multi_tad_crossing": (
-                multi_tad_count / (frames * n_boundaries),
+                ratio(multi_tad_count, frames * n_boundaries),
                 multi_tad_count,
                 frames * n_boundaries,
             ),
             "one_ctcf_leg_stripe": (
-                one_ctcf_count / (frames * n_boundaries),
+                ratio(one_ctcf_count, frames * n_boundaries),
                 one_ctcf_count,
                 frames * n_boundaries,
             ),
             "boundary_crossing_stripe": (
-                stripe_cross_count / (frames * n_boundaries),
+                ratio(stripe_cross_count, frames * n_boundaries),
                 stripe_cross_count,
                 frames * n_boundaries,
             ),
@@ -548,11 +650,11 @@ def analyze_run(
                 "chain": chain_idx,
                 "n_loops": n_spans,
                 "mean_loop_kb": mean_span * kb_per_site,
-                "median_loop_kb": _safe_percentile(spans, 50) * kb_per_site,
-                "p75_loop_kb": _safe_percentile(spans, 75) * kb_per_site,
-                "p90_loop_kb": _safe_percentile(spans, 90) * kb_per_site,
-                "p95_loop_kb": _safe_percentile(spans, 95) * kb_per_site,
-                "p99_loop_kb": _safe_percentile(spans, 99) * kb_per_site,
+                "median_loop_kb": _hist_percentile(hist, 50) * kb_per_site,
+                "p75_loop_kb": _hist_percentile(hist, 75) * kb_per_site,
+                "p90_loop_kb": _hist_percentile(hist, 90) * kb_per_site,
+                "p95_loop_kb": _hist_percentile(hist, 95) * kb_per_site,
+                "p99_loop_kb": _hist_percentile(hist, 99) * kb_per_site,
             }
         )
 
@@ -560,18 +662,18 @@ def analyze_run(
             {
                 "config": label,
                 "chain": chain_idx,
-                "one_ctcf_leg_any_per_frame": one_ctcf_count / frames,
-                "one_ctcf_leg_any_per_boundary_frame": one_ctcf_count / (frames * n_boundaries),
-                "boundary_crossing_stripe_per_frame": stripe_cross_count / frames,
-                "boundary_crossing_stripe_per_boundary_frame": stripe_cross_count / (frames * n_boundaries),
+                "one_ctcf_leg_any_per_frame": ratio(one_ctcf_count, frames),
+                "one_ctcf_leg_any_per_boundary_frame": ratio(one_ctcf_count, frames * n_boundaries),
+                "boundary_crossing_stripe_per_frame": ratio(stripe_cross_count, frames),
+                "boundary_crossing_stripe_per_boundary_frame": ratio(stripe_cross_count, frames * n_boundaries),
                 "boundary_crossing_stripe_frac_of_one_ctcf": stripe_cross_count / max(one_ctcf_count, 1),
-                "any_cross_per_frame": cross_tad_count / frames,
-                "any_cross_per_boundary_frame": cross_tad_count / (frames * n_boundaries),
-                "multi_tad_cross_per_frame": multi_tad_count / frames,
-                "multi_tad_cross_per_boundary_frame": multi_tad_count / (frames * n_boundaries),
-                "crossed_boundaries_per_frame": crossed_boundary_total / frames,
-                "crossed_boundaries_per_boundary_frame": crossed_boundary_total / (frames * n_boundaries),
-                "boundary_pass_events_per_boundary_frame": pass_events / ((frames - 1) * n_boundaries),
+                "any_cross_per_frame": ratio(cross_tad_count, frames),
+                "any_cross_per_boundary_frame": ratio(cross_tad_count, frames * n_boundaries),
+                "multi_tad_cross_per_frame": ratio(multi_tad_count, frames),
+                "multi_tad_cross_per_boundary_frame": ratio(multi_tad_count, frames * n_boundaries),
+                "crossed_boundaries_per_frame": ratio(crossed_boundary_total, frames),
+                "crossed_boundaries_per_boundary_frame": ratio(crossed_boundary_total, frames * n_boundaries),
+                "boundary_pass_events_per_boundary_frame": ratio(pass_events, (frames - 1) * n_boundaries),
                 "boundary_pass_events_per_moving_leg_step": pass_events / max(moving_steps, 1),
             }
         )
@@ -598,21 +700,26 @@ def _two_sample_permutation_pvalue(base_values: np.ndarray, comp_values: np.ndar
 
     if total_partitions > 200_000:
         rng = np.random.default_rng(12345)
-        sampled = np.empty(200_000, dtype=float)
-        for idx in range(sampled.size):
+        mask = np.zeros(n_total, dtype=bool)
+        extreme = 0
+        for _ in range(200_000):
             comp_idx = rng.choice(n_total, size=n_comp, replace=False)
-            mask = np.zeros(n_total, dtype=bool)
             mask[comp_idx] = True
-            sampled[idx] = abs(float(pooled[mask].mean() - pooled[~mask].mean()))
-        return float(np.mean(sampled >= observed - 1e-15))
+            permuted = abs(float(pooled[mask].mean() - pooled[~mask].mean()))
+            if permuted >= observed - 1e-15:
+                extreme += 1
+            mask[comp_idx] = False
+        return extreme / 200_000
 
     extreme = 0
+    mask = np.zeros(n_total, dtype=bool)
     for comp_idx_tuple in combinations(range(n_total), n_comp):
-        mask = np.zeros(n_total, dtype=bool)
-        mask[list(comp_idx_tuple)] = True
+        comp_idx = list(comp_idx_tuple)
+        mask[comp_idx] = True
         permuted = abs(float(pooled[mask].mean() - pooled[~mask].mean()))
         if permuted >= observed - 1e-15:
             extreme += 1
+        mask[comp_idx] = False
     return extreme / total_partitions
 
 
@@ -826,6 +933,7 @@ def plot_metric_panels_svg(
 
     svg_path = out_dir / f"{stem}_all_metrics.svg"
     fig.savefig(svg_path, format="svg")
+    fig.savefig(svg_path.with_suffix(".png"), format="png")
     plt.close(fig)
     return svg_path
 

@@ -70,6 +70,7 @@ from sweep_rnapoff_boundary_strength_1d import (  # noqa: E402
     METRIC_LABELS,
     METRIC_ORDER,
     _norm_for_row,
+    _analyze_sweep_point,
     _run_sweep_point,
     multiplier_label,
     parse_multipliers,
@@ -225,7 +226,7 @@ def make_grid_config(
     for key in TRIO_KEYS:
         kwargs[key] = block_prob
 
-    lifetime_ctcf = int(round(base_ctcf * ctcf_mult))
+    lifetime_ctcf = max(1, int(round(base_ctcf * ctcf_mult)))
     lef["lifetime_ctcf"] = lifetime_ctcf
 
     record = {
@@ -275,7 +276,7 @@ def block_tick_labels(probs: list[float], seconds_per_step: float = SECONDS_PER_
 
 def ctcf_tick_labels(multipliers: list[float], base_value: float) -> list[str]:
     """x-axis tick = multiplier plus the resulting absolute lifetime (steps)."""
-    return [f"{multiplier_label(m)}\n{int(round(base_value * m))}" for m in multipliers]
+    return [f"{multiplier_label(m)}\n{max(1, int(round(base_value * m)))}" for m in multipliers]
 
 
 def plot_grid_heatmaps(
@@ -364,6 +365,7 @@ def plot_grid_heatmaps(
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, format="svg", bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".png"), format="png", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -536,13 +538,18 @@ def main() -> None:
                 print(f"[{n}/{total}] done {res['label']}")
                 resolved_h5[res["label"]] = Path(res["h5"])
 
-    # 3) analyze each resolved H5 (in main process, grid order) -----------
-    for task in tasks:
-        label = task["label"]
-        core_rows, boundary_metric_rows, _, _ = analyze_run(
-            label, Path(task["cfg_path"]), resolved_h5[label], base_topology
-        )
-        all_metric_rows.append(selected_metric_rows(core_rows, boundary_metric_rows))
+    analysis_tasks = [
+        {"label": task["label"], "cfg_path": task["cfg_path"],
+         "h5": str(resolved_h5[task["label"]]), "base_topology": base_topology}
+        for task in tasks
+    ]
+    if jobs == 1:
+        for result in map(_analyze_sweep_point, analysis_tasks):
+            all_metric_rows.append(result["frame"])
+    else:
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("fork")) as ex:
+            for result in ex.map(_analyze_sweep_point, analysis_tasks):
+                all_metric_rows.append(result["frame"])
 
     per_chain = pd.concat(all_metric_rows, ignore_index=True)
     summary, stats = summarize_sweep(per_chain, args.label1, grid_labels)

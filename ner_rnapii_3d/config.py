@@ -243,8 +243,51 @@ def _validate_scale(cfg: LEFConfig) -> LEFConfig:
     bp = int(cfg.bp_per_site)
     if bp <= 0:
         raise ValueError(f"lef.bp_per_site must be > 0, got {bp}")
+    if int(cfg.chain_length) <= 0:
+        raise ValueError(f"lef.chain_length must be > 0, got {cfg.chain_length}")
+    if int(cfg.num_chains) <= 0:
+        raise ValueError(f"lef.num_chains must be > 0, got {cfg.num_chains}")
+    if int(cfg.separation) <= 0:
+        raise ValueError(f"lef.separation must be > 0, got {cfg.separation}")
     if cfg.tick_seconds is None or cfg.tick_seconds <= 0:
         raise ValueError(f"lef.tick_seconds must be > 0, got {cfg.tick_seconds}")
+    for name in ("lifetime", "lifetime_stalled"):
+        value = getattr(cfg, name)
+        if value is None or value <= 0:
+            raise ValueError(f"lef.{name} must be > 0, got {value}")
+    if cfg.lifetime_ctcf is not None and cfg.lifetime_ctcf <= 0:
+        raise ValueError(
+            f"lef.lifetime_ctcf must be > 0 or null, got {cfg.lifetime_ctcf}"
+        )
+    if int(cfg.warmup_steps) < 0:
+        raise ValueError(f"lef.warmup_steps must be >= 0, got {cfg.warmup_steps}")
+    if int(cfg.trajectory_length) < 0:
+        raise ValueError(
+            f"lef.trajectory_length must be >= 0, got {cfg.trajectory_length}"
+        )
+    if int(cfg.max_rnapii) < 0:
+        raise ValueError(f"lef.max_rnapii must be >= 0, got {cfg.max_rnapii}")
+
+    # Every initially loaded LEF needs a distinct adjacent in-chain pair. When
+    # this capacity is exceeded, _load_one returns False and the old caller left
+    # that slot at position zero, silently corrupting occupancy and recordings.
+    pair_capacity = int(cfg.num_chains) * (int(cfg.chain_length) // 2)
+    if cfg.num_lefs > pair_capacity:
+        raise ValueError(
+            "lef.separation requests "
+            f"{cfg.num_lefs} LEFs, but {cfg.num_chains} chains of length "
+            f"{cfg.chain_length} can hold at most {pair_capacity} adjacent pairs"
+        )
+
+    has_load = cfg.plugins.rnapii_load is not None
+    has_move = cfg.plugins.rnapii_translocate is not None
+    if has_load != has_move:
+        raise ValueError(
+            "lef.plugins.rnapii_load and rnapii_translocate must either both be set "
+            "or both be null"
+        )
+    if has_load and int(cfg.max_rnapii) == 0:
+        raise ValueError("lef.max_rnapii must be > 0 when RNAPII is enabled")
     return cfg
 
 

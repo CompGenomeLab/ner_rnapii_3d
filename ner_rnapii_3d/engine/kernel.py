@@ -78,7 +78,7 @@ def _load_one(mt, occupied, lpos, rpos, lctcf, rctcf, lstalled, rstalled,
             lctcf[slot] = 0; rctcf[slot] = 0
             lstalled[slot] = 0; rstalled[slot] = 0
             return True
-    return False
+    raise RuntimeError("No same-chain adjacent empty sites available for cohesin loading")
 
 
 @njit(cache=True)
@@ -537,8 +537,10 @@ def _stateful_translocate_c(mt, occupied, rnapii_at, leg_at, rn_pos, rn_gene,
                             pause_term_global, term_step_prob, stride,
                             stall_prob, push_prob, headon_push_prob, N, chain_length,
                             ep_count, g_req_enh, g_k, g_logic, g_syn,
-                            rn_lesion_stalled, lesion_at, les_type, les_state, has_lesions):
-    dead = np.zeros(n_rn, dtype=np.int8)
+                            rn_lesion_stalled, lesion_at, les_type, les_state, has_lesions,
+                            dead):
+    for idx in range(n_rn):
+        dead[idx] = 0
     for idx in range(n_rn - 1, -1, -1):
         g = rn_gene[idx]; tes = g_tes[g]; direction = g_dir[g]
         # _evict_if_lesion_repaired: a Pol stalled by a lesion that has since been
@@ -785,6 +787,9 @@ def simulate_coupled(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_
     (enh_pos, enh_off, g_req_enh, g_load_req, g_k, g_logic, g_syn) = gene_enh
     n_genes = g_tss.shape[0]
     ep_count = np.zeros(n_genes, np.int64)
+    ep_left = np.empty(nlef, np.int64)
+    ep_right = np.empty(nlef, np.int64)
+    ep_prefix_max = np.empty(nlef, np.int64)
     mt = nb_seed(seed)
     occupied = np.zeros(N, dtype=np.int8)
     leg_at = np.full(N, -1, dtype=np.int64)
@@ -806,6 +811,7 @@ def simulate_coupled(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_
     rn_pos = np.full(cap, -1, np.int64); rn_gene = np.full(cap, -1, np.int64)
     rn_state = np.full(cap, -1, np.int64); rn_uid = np.full(cap, -1, np.int64)
     rn_lesion_stalled = np.zeros(cap, np.int8)
+    rn_dead = np.empty(cap, np.int8)
     # no-lesion regime: dummy lesion arrays (has_lesions=False -> never read)
     _les_at = np.zeros(N, np.int64); _les_t = np.zeros(1, np.int64); _les_s = np.zeros(1, np.int64)
     n_rn = 0; uid_next = 0
@@ -813,7 +819,8 @@ def simulate_coupled(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_
     def _tick(n_rn, uid_next):
         # EP contacts computed FIRST each tick (lef.run order), from current cohesins.
         _compute_ep_contacts(lpos, rpos, nlef, enh_pos, enh_off, g_tss, n_genes,
-                             tol, chain_length, ep_count)
+                             tol, chain_length, ep_count,
+                             ep_left, ep_right, ep_prefix_max)
         n_rn, uid_next = _load_rnapii_c(mt, occupied, rnapii_at, rn_pos, rn_gene,
                                         rn_state, rn_uid, n_rn, uid_next, g_tss, g_dir, g_load, g_pause_off, 1, n_genes,
                                         ep_count, g_load_req, g_k, g_logic, g_syn, rn_lesion_stalled)
@@ -824,7 +831,8 @@ def simulate_coupled(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_
                                        pause_term_global, term_step_prob, stride,
                                        stall_prob, push_prob, headon_push_prob, N, chain_length,
                                        ep_count, g_req_enh, g_k, g_logic, g_syn,
-                                       rn_lesion_stalled, _les_at, _les_t, _les_s, False)
+                                       rn_lesion_stalled, _les_at, _les_t, _les_s, False,
+                                       rn_dead)
         _translocate_c(mt, occupied, rnapii_at, leg_at, lpos, rpos, lctcf, rctcf,
                        lstalled, rstalled, lrnst, rrnst, lpushed, rpushed,
                        rn_state, ctcf_cap, ctcf_rel, block_prob, nlef, N, chain_length,
@@ -904,28 +912,28 @@ def build_lesion_state(args: dict):
 @njit(cache=True)
 def _update_lesions(mt, N, les_site, les_type, les_state, lesion_at, n_les,
                     target, has_p, cdf, has_rm, rate_mult,
-                    prerecog_ticks, repair_ticks, gene_body_mask, type_a_prob, force_type):
+                    prerecog_ticks, repair_ticks, gene_body_mask, type_a_prob, force_type,
+                    random_scratch, dead, candidate_scratch):
     """One lesion tick: stochastic PRE->REPAIR->removed, then refill to target."""
     if n_les > 0:
         pre_rate = 1.0 / (prerecog_ticks if prerecog_ticks >= 1 else 1)
         rep_rate = 1.0 / (repair_ticks if repair_ticks >= 1 else 1)
-        u = np.empty(n_les, dtype=np.float64)
         for i in range(n_les):
-            u[i] = nb_random(mt)
-        dead = np.zeros(n_les, dtype=np.int8)
+            random_scratch[i] = nb_random(mt)
+            dead[i] = 0
         for i in range(n_les):
             m = rate_mult[les_site[i]] if has_rm else 1.0
             if les_state[i] == LESION_PRE:
                 pr = pre_rate * m
                 if pr > 1.0:
                     pr = 1.0
-                if u[i] < pr:
+                if random_scratch[i] < pr:
                     les_state[i] = LESION_REPAIR
             else:
                 rr = rep_rate * m
                 if rr > 1.0:
                     rr = 1.0
-                if u[i] < rr:
+                if random_scratch[i] < rr:
                     dead[i] = 1
         w = 0
         for i in range(n_les):
@@ -949,16 +957,15 @@ def _update_lesions(mt, N, les_site, les_type, les_state, lesion_at, n_les,
             k = need + head
             # numpy draws the WHOLE candidate batch first (choice/randint), THEN the
             # per-site _assign_type draws happen in the loop -- match that draw order.
-            cand = np.empty(k, dtype=np.int64)
             if has_p:
                 for j in range(k):
                     s = np.searchsorted(cdf, nb_random(mt), side="right")
-                    cand[j] = s if s < N else N - 1
+                    candidate_scratch[j] = s if s < N else N - 1
             else:
                 for j in range(k):
-                    cand[j] = nb_randint(mt, 0, N)
+                    candidate_scratch[j] = nb_randint(mt, 0, N)
             for j in range(k):
-                site = cand[j]
+                site = candidate_scratch[j]
                 if lesion_at[site] < 0:
                     if force_type >= 0:
                         lt = force_type
@@ -1088,11 +1095,16 @@ def simulate_cohesin_lesion(seed, N, chain_length, nlef, ctcf_cap, ctcf_rel, les
     les_state = np.full(cap_les, -1, np.int64)
     lesion_at = np.full(N, -1, np.int64)
     n_les = 0
+    lesion_random = np.empty(cap_les, np.float64)
+    lesion_dead = np.empty(cap_les, np.int8)
+    candidate_cap = target + (target // 2 if target // 2 >= 4 else 4)
+    lesion_candidates = np.empty(candidate_cap if candidate_cap > 0 else 1, np.int64)
 
     def _tick(n_les):
         n_les = _update_lesions(mt, N, les_site, les_type, les_state, lesion_at, n_les,
                                 target, has_p, cdf, has_rm, rate_mult, prerecog_ticks,
-                                repair_ticks, gene_body_mask, type_a_prob, force_type)
+                                repair_ticks, gene_body_mask, type_a_prob, force_type,
+                                lesion_random, lesion_dead, lesion_candidates)
         _translocate_les(mt, occupied, lpos, rpos, lctcf, rctcf, lstalled, rstalled,
                          lrnst, rrnst, ctcf_cap, ctcf_rel, lesion_at, les_type, les_state,
                          lesion_block_prob, rnapii_enabled, targeted, nlef, N, chain_length,
@@ -1169,29 +1181,83 @@ def _enh_factor(n_contacts, k, logic, synergy):
 
 @njit(cache=True)
 def _compute_ep_contacts(lpos, rpos, nlef, enh_pos, enh_off, gene_tss, n_genes,
-                         tol, chain_length, ep_count):
+                         tol, chain_length, ep_count,
+                         loop_left, loop_right, prefix_max_right):
     """#enhancers of each gene currently bracketed by some same-chain cohesin loop.
 
-    Byte-identical to compute_ep_contacts: "loop with L<=lo and R>=hi" is the same
-    boolean as the bisect/running-max query, so the simple O(genes*enh*lefs) scan
-    is used (the kernel is fast regardless)."""
+    Byte-identical to :func:`plugins.rnapii.compute_ep_contacts`: sort loops by
+    left endpoint and carry a chain-local running maximum of the right endpoint.
+    For a query ``(lo, hi)``, a contact exists iff the prefix of loops with
+    ``L <= lo`` has ``max(R) >= hi``. This replaces the old full LEF scan for
+    every enhancer with one binary search, without changing RNG use or results.
+    """
+    for c in range(nlef):
+        lc = lpos[c]
+        rc = rpos[c]
+        if lc <= rc:
+            loop_left[c] = lc
+            loop_right[c] = rc
+        else:
+            loop_left[c] = rc
+            loop_right[c] = lc
+
+    order = np.argsort(loop_left[:nlef])
+    previous_chain = -1
+    running_max = -1
+    for j in range(nlef):
+        c = order[j]
+        chain = loop_left[c] // chain_length
+        if chain != previous_chain:
+            previous_chain = chain
+            running_max = -1
+        if loop_right[c] > running_max:
+            running_max = loop_right[c]
+        prefix_max_right[j] = running_max
+
     for g in range(n_genes):
         tss = gene_tss[g]
         gchain = tss // chain_length
+        chain_lo = gchain * chain_length
+        chain_hi = chain_lo + chain_length
+
+        # Locate this chain's loop slice in the globally L-sorted order. Keeping
+        # the bounds explicit also preserves the reference behaviour for unusual
+        # configs whose enhancer coordinate is outside its promoter's chain.
+        left = 0
+        right = nlef
+        while left < right:
+            mid = (left + right) // 2
+            if loop_left[order[mid]] < chain_lo:
+                left = mid + 1
+            else:
+                right = mid
+        chain_start = left
+        left = chain_start
+        right = nlef
+        while left < right:
+            mid = (left + right) // 2
+            if loop_left[order[mid]] < chain_hi:
+                left = mid + 1
+            else:
+                right = mid
+        chain_end = left
+
         cnt = 0
         for e in range(enh_off[g], enh_off[g + 1]):
             enh = enh_pos[e]
             lo = (tss if tss < enh else enh) + tol
             hi = (tss if tss > enh else enh) - tol
-            found = False
-            for c in range(nlef):
-                lc = lpos[c]; hc = rpos[c]
-                if lc > hc:
-                    tmp = lc; lc = hc; hc = tmp
-                if (lc // chain_length) == gchain and lc <= lo and hc >= hi:
-                    found = True
-                    break
-            if found:
+
+            # bisect_right(loop_left, lo) within the promoter chain.
+            left = chain_start
+            right = chain_end
+            while left < right:
+                mid = (left + right) // 2
+                if loop_left[order[mid]] <= lo:
+                    left = mid + 1
+                else:
+                    right = mid
+            if left > chain_start and prefix_max_right[left - 1] >= hi:
                 cnt += 1
         ep_count[g] = cnt
 
@@ -1269,6 +1335,9 @@ def simulate_full(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_cap
     (enh_pos, enh_off, g_req_enh, g_load_req, g_k, g_logic, g_syn) = gene_enh
     n_genes = g_tss.shape[0]
     ep_count = np.zeros(n_genes, np.int64)
+    ep_left = np.empty(nlef, np.int64)
+    ep_right = np.empty(nlef, np.int64)
+    ep_prefix_max = np.empty(nlef, np.int64)
     mt = nb_seed(seed)
     occupied = np.zeros(N, dtype=np.int8)
     leg_at = np.full(N, -1, dtype=np.int64)
@@ -1289,19 +1358,28 @@ def simulate_full(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_cap
     rn_pos = np.full(cap, -1, np.int64); rn_gene = np.full(cap, -1, np.int64)
     rn_state = np.full(cap, -1, np.int64); rn_uid = np.full(cap, -1, np.int64)
     rn_lesion_stalled = np.zeros(cap, np.int8)
+    rn_dead = np.empty(cap, np.int8)
     n_rn = 0; uid_next = 0
 
     lcap = record_les_cap if record_les_cap > 0 else 1
     les_site = np.full(lcap, -1, np.int64); les_typ = np.full(lcap, -1, np.int64)
     les_sta = np.full(lcap, -1, np.int64)
     n_les = 0
+    lesion_random = np.empty(lcap, np.float64)
+    lesion_dead = np.empty(lcap, np.int8)
+    candidate_cap = les_target + (les_target // 2 if les_target // 2 >= 4 else 4)
+    lesion_candidates = np.empty(candidate_cap if candidate_cap > 0 else 1, np.int64)
 
     def _tick(n_rn, uid_next, n_les):
         # Order matches _advance_one_step: lesions FIRST, then EP, load, rnapii, cohesin.
         n_les = _update_lesions(mt, N, les_site, les_typ, les_sta, lesion_at, n_les,
                                 les_target, les_has_p, les_cdf, les_has_rm, les_rate_mult,
-                                les_prerecog, les_repair, les_gbmask, les_type_a_prob, les_force_type)
-        _compute_ep_contacts(lpos, rpos, nlef, enh_pos, enh_off, g_tss, n_genes, tol, chain_length, ep_count)
+                                les_prerecog, les_repair, les_gbmask, les_type_a_prob,
+                                les_force_type, lesion_random, lesion_dead,
+                                lesion_candidates)
+        _compute_ep_contacts(lpos, rpos, nlef, enh_pos, enh_off, g_tss, n_genes,
+                             tol, chain_length, ep_count,
+                             ep_left, ep_right, ep_prefix_max)
         n_rn, uid_next = _load_rnapii_c(mt, occupied, rnapii_at, rn_pos, rn_gene, rn_state, rn_uid,
                                         n_rn, uid_next, g_tss, g_dir, g_load, g_pause_off, 1, n_genes,
                                         ep_count, g_load_req, g_k, g_logic, g_syn, rn_lesion_stalled)
@@ -1312,7 +1390,8 @@ def simulate_full(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_cap
                                        pause_term_global, term_step_prob, stride,
                                        stall_prob, push_prob, headon_push_prob, N, chain_length,
                                        ep_count, g_req_enh, g_k, g_logic, g_syn,
-                                       rn_lesion_stalled, lesion_at, les_typ, les_sta, True)
+                                       rn_lesion_stalled, lesion_at, les_typ, les_sta, True,
+                                       rn_dead)
         _translocate_c(mt, occupied, rnapii_at, leg_at, lpos, rpos, lctcf, rctcf,
                        lstalled, rstalled, lrnst, rrnst, lpushed, rpushed,
                        rn_state, ctcf_cap, ctcf_rel, block_prob, nlef, N, chain_length,
@@ -1357,8 +1436,10 @@ def simulate_full(seed, N, chain_length, nlef, cap, gene_soa, gene_enh, ctcf_cap
 @njit(cache=True)
 def _advance_block(mt, occupied, leg_at, rnapii_at, lesion_at,
                    lpos, rpos, lctcf, rctcf, lstalled, rstalled, lrnst, rrnst, lpushed, rpushed,
-                   rn_pos, rn_gene, rn_state, rn_uid, rn_lesion_stalled,
-                   les_site, les_typ, les_sta, ep_count, nstate,
+                   rn_pos, rn_gene, rn_state, rn_uid, rn_lesion_stalled, rn_dead,
+                   les_site, les_typ, les_sta, lesion_random, lesion_dead,
+                   lesion_candidates, ep_count, ep_left, ep_right,
+                   ep_prefix_max, nstate,
                    g_tss, g_tes, g_dir, g_load, g_init, g_release, g_pause_off,
                    g_elong, g_term, g_window, g_pause_term,
                    enh_pos, enh_off, g_req_enh, g_load_req, g_k, g_logic, g_syn,
@@ -1370,17 +1451,22 @@ def _advance_block(mt, occupied, leg_at, rnapii_at, lesion_at,
                    N, chain_length, nlef, n_genes, has_rnapii, has_lesions, occl,
                    block_len, do_record, record_cap, lcap,
                    coh_buf, rp_buf, rs_buf, ri_buf, lp_buf, ls_buf):
-    """Run ``block_len`` ticks; ``nstate``=[n_rn, uid_next, n_les] mutated in place.
+    """Run ``block_len`` ticks; ``nstate`` stores population state and block peak.
     If ``do_record``, fill the (block_len, ...) buffers. Per-tick order matches
     _advance_one_step: lesions, EP, load, rnapii, cohesin."""
     n_rn = nstate[0]; uid_next = nstate[1]; n_les = nstate[2]
+    peak_rn = n_rn
     for t in range(block_len):
         if has_lesions:
             n_les = _update_lesions(mt, N, les_site, les_typ, les_sta, lesion_at, n_les,
                                     les_target, les_has_p, les_cdf, les_has_rm, les_rate_mult,
-                                    les_prerecog, les_repair, les_gbmask, les_type_a_prob, les_force_type)
+                                    les_prerecog, les_repair, les_gbmask, les_type_a_prob,
+                                    les_force_type, lesion_random, lesion_dead,
+                                    lesion_candidates)
         if has_rnapii:
-            _compute_ep_contacts(lpos, rpos, nlef, enh_pos, enh_off, g_tss, n_genes, tol, chain_length, ep_count)
+            _compute_ep_contacts(lpos, rpos, nlef, enh_pos, enh_off, g_tss, n_genes,
+                                 tol, chain_length, ep_count,
+                                 ep_left, ep_right, ep_prefix_max)
             n_rn, uid_next = _load_rnapii_c(mt, occupied, rnapii_at, rn_pos, rn_gene, rn_state, rn_uid,
                                             n_rn, uid_next, g_tss, g_dir, g_load, g_pause_off, occl, n_genes,
                                             ep_count, g_load_req, g_k, g_logic, g_syn, rn_lesion_stalled)
@@ -1391,7 +1477,8 @@ def _advance_block(mt, occupied, leg_at, rnapii_at, lesion_at,
                                            pause_term_global, term_step_prob, stride,
                                            stall_prob, push_prob, headon_push_prob, N, chain_length,
                                            ep_count, g_req_enh, g_k, g_logic, g_syn,
-                                           rn_lesion_stalled, lesion_at, les_typ, les_sta, has_lesions)
+                                           rn_lesion_stalled, lesion_at, les_typ, les_sta, has_lesions,
+                                           rn_dead)
             _translocate_c(mt, occupied, rnapii_at, leg_at, lpos, rpos, lctcf, rctcf,
                            lstalled, rstalled, lrnst, rrnst, lpushed, rpushed,
                            rn_state, ctcf_cap, ctcf_rel, block_prob, nlef, N, chain_length,
@@ -1407,6 +1494,9 @@ def _advance_block(mt, occupied, leg_at, rnapii_at, lesion_at,
                          ctcf_cap, ctcf_rel, nlef, N, chain_length,
                          lifetime, lifetime_stalled, lifetime_ctcf)
 
+        if n_rn > peak_rn:
+            peak_rn = n_rn
+
         if do_record:
             for i in range(nlef):
                 coh_buf[t, i, 0] = lpos[i]; coh_buf[t, i, 1] = rpos[i]
@@ -1421,7 +1511,7 @@ def _advance_block(mt, occupied, leg_at, rnapii_at, lesion_at,
                 for i in range(mm):
                     s = ssort[i]; k = lesion_at[s]
                     lp_buf[t, i, 0] = s; lp_buf[t, i, 1] = les_typ[k]; ls_buf[t, i] = les_sta[k]
-    nstate[0] = n_rn; nstate[1] = uid_next; nstate[2] = n_les
+    nstate[0] = n_rn; nstate[1] = uid_next; nstate[2] = n_les; nstate[3] = peak_rn
 
 
 @njit(cache=True)
@@ -1458,6 +1548,31 @@ def init_chunked(cfg, args):
     bp = int(getattr(cfg, "bp_per_site", 250))
     tol = int(args.get("ep_contact_tolerance", max(1, round(2000 / bp))))
 
+    if nlef > (N // chain_length) * (chain_length // 2):
+        raise ValueError(
+            f"Cannot place {nlef} LEFs on {N // chain_length} chains of "
+            f"length {chain_length}: too few free adjacent in-chain pairs"
+        )
+    if rnapii:
+        if int(cfg.max_rnapii) <= 0:
+            raise ValueError("max_rnapii must be > 0 when RNAPII is enabled")
+        for i, gene in enumerate(args.get("genes", ())):
+            sites = (("tss", int(gene.tss)), ("tes", int(gene.tes)))
+            for label, site in sites:
+                if not (0 <= site < N):
+                    raise ValueError(
+                        f"Gene {i} {label}={site} is outside the {N}-site lattice"
+                    )
+            if int(gene.tss) // chain_length != int(gene.tes) // chain_length:
+                raise ValueError(
+                    f"Gene {i} crosses a chain boundary: tss={gene.tss}, tes={gene.tes}"
+                )
+            for enhancer in gene.enhancers:
+                if not (0 <= int(enhancer) < N):
+                    raise ValueError(
+                        f"Gene {i} enhancer={enhancer} is outside the {N}-site lattice"
+                    )
+
     mt = nb_seed(seed)
     occupied = np.zeros(N, np.int8)
     leg_at = np.full(N, -1, np.int64); rnapii_at = np.full(N, -1, np.int64)
@@ -1473,23 +1588,40 @@ def init_chunked(cfg, args):
     rn_pos = np.full(cap, -1, np.int64); rn_gene = np.full(cap, -1, np.int64)
     rn_state = np.full(cap, -1, np.int64); rn_uid = np.full(cap, -1, np.int64)
     rn_lesion_stalled = np.zeros(cap, np.int8)
+    rn_dead = np.empty(cap, np.int8)
 
     g = build_gene_soa(args["genes"]) if rnapii else build_gene_soa([])
     e = build_gene_enh(args["genes"]) if rnapii else build_gene_enh([])
     n_genes = g[0].shape[0]
     ep_count = np.zeros(n_genes, np.int64)
+    ep_left = np.empty(nlef, np.int64)
+    ep_right = np.empty(nlef, np.int64)
+    ep_prefix_max = np.empty(nlef, np.int64)
     ctcf_cap, ctcf_rel = build_ctcf_arrays(args, N)
     block_prob = build_block_prob(args) if rnapii else np.ones(5, np.float64)
 
     if lesion:
         ls = build_lesion_state(args)
         lcap = int(args.get("lesion_target", 0))
+        active_target = int(ls[0])
+        if not (0 <= active_target <= lcap <= N):
+            raise ValueError(
+                "Invalid lesion capacity: require 0 <= active target <= "
+                f"lesion_target <= N, got {active_target}, {lcap}, {N}"
+            )
     else:
         ls = (0, False, np.zeros(1), False, np.ones(1), 1, 1, np.zeros(1, np.int8), 0.5, -1)
         lcap = 0
     lcap_alloc = lcap if lcap > 0 else 1
     les_site = np.full(lcap_alloc, -1, np.int64); les_typ = np.full(lcap_alloc, -1, np.int64)
     les_sta = np.full(lcap_alloc, -1, np.int64)
+    lesion_random = np.empty(lcap_alloc, np.float64)
+    lesion_dead = np.empty(lcap_alloc, np.int8)
+    lesion_target = int(ls[0])
+    candidate_cap = lesion_target + (
+        lesion_target // 2 if lesion_target // 2 >= 4 else 4
+    )
+    lesion_candidates = np.empty(candidate_cap if candidate_cap > 0 else 1, np.int64)
 
     record_cap = int(cfg.max_rnapii) * int(cfg.num_chains) if rnapii else 0
 
@@ -1497,9 +1629,13 @@ def init_chunked(cfg, args):
         mt=mt, occupied=occupied, leg_at=leg_at, rnapii_at=rnapii_at, lesion_at=lesion_at,
         lpos=lpos, rpos=rpos, lctcf=lctcf, rctcf=rctcf, lstalled=lstalled, rstalled=rstalled,
         lrnst=lrnst, rrnst=rrnst, lpushed=lpushed, rpushed=rpushed,
-        rn_pos=rn_pos, rn_gene=rn_gene, rn_state=rn_state, rn_uid=rn_uid, rn_lesion_stalled=rn_lesion_stalled,
-        les_site=les_site, les_typ=les_typ, les_sta=les_sta, ep_count=ep_count,
-        nstate=np.zeros(3, np.int64), g=g, e=e, ctcf_cap=ctcf_cap, ctcf_rel=ctcf_rel, block_prob=block_prob,
+        rn_pos=rn_pos, rn_gene=rn_gene, rn_state=rn_state, rn_uid=rn_uid,
+        rn_lesion_stalled=rn_lesion_stalled, rn_dead=rn_dead,
+        les_site=les_site, les_typ=les_typ, les_sta=les_sta,
+        lesion_random=lesion_random, lesion_dead=lesion_dead,
+        lesion_candidates=lesion_candidates, ep_count=ep_count,
+        ep_left=ep_left, ep_right=ep_right, ep_prefix_max=ep_prefix_max,
+        nstate=np.zeros(4, np.int64), g=g, e=e, ctcf_cap=ctcf_cap, ctcf_rel=ctcf_rel, block_prob=block_prob,
         ls=ls, lesion_block_prob=float(args.get("lesion_block_prob", 1.0)),
         lifetime=float(args["LIFETIME"]), lifetime_stalled=float(args["LIFETIME_STALLED"]),
         lifetime_rnstalled=float(args.get("LIFETIME_RNAPII_STALLED", args["LIFETIME_STALLED"])),
@@ -1527,13 +1663,30 @@ def block_len_for(run, traj):
     return max(1, min(traj, _BLOCK_BYTES_MAX // max(1, per_tick)))
 
 
-def advance_chunked(run, block_len, do_record):
+def advance_chunked(run, block_len, do_record, compact_recording=False):
     """Advance ``block_len`` ticks. If ``do_record`` return (coh, rp, rs, ri, lp, ls)
-    block arrays (rp/.. = None when no RNAPII; lp/ls = None when no lesions)."""
+    block arrays (rp/.. = None when no RNAPII; lp/ls = None when no lesions).
+
+    ``compact_recording`` narrows only the transient RNAPII buffers. Starting
+    from the current population, at most one Pol per gene can load per tick, so
+    ``n_rn + block_len * n_genes`` is a strict upper bound on every population
+    recorded in this block. The default retains the full-width public API used
+    by the equivalence harness; the HDF5 streaming path opts into compact buffers
+    and supplies ``-1`` padding through the dataset fill value.
+    """
     r = run
     if do_record:
         coh = np.empty((block_len, r.nlef, 2), np.int32)
-        rc = r.record_cap if r.has_rnapii else 1
+        if r.has_rnapii:
+            rc = r.record_cap
+            if compact_recording:
+                max_new = int(r.nstate[0]) + int(block_len) * int(r.n_genes)
+                rc = min(rc, r.N, max_new)
+                # Keep arrays two-dimensional even for a block in which no Pol
+                # can exist; the on-disk dataset is likewise kept at width >= 1.
+                rc = max(1, rc)
+        else:
+            rc = 1
         rp = np.empty((block_len, rc, 2), np.int32); rp[:] = -1
         rs = np.empty((block_len, rc), np.int32); rs[:] = -1
         ri = np.empty((block_len, rc), np.int32); ri[:] = -1
@@ -1548,15 +1701,24 @@ def advance_chunked(run, block_len, do_record):
     _advance_block(
         r.mt, r.occupied, r.leg_at, r.rnapii_at, r.lesion_at,
         r.lpos, r.rpos, r.lctcf, r.rctcf, r.lstalled, r.rstalled, r.lrnst, r.rrnst, r.lpushed, r.rpushed,
-        r.rn_pos, r.rn_gene, r.rn_state, r.rn_uid, r.rn_lesion_stalled,
-        r.les_site, r.les_typ, r.les_sta, r.ep_count, r.nstate,
+        r.rn_pos, r.rn_gene, r.rn_state, r.rn_uid, r.rn_lesion_stalled, r.rn_dead,
+        r.les_site, r.les_typ, r.les_sta, r.lesion_random, r.lesion_dead,
+        r.lesion_candidates, r.ep_count, r.ep_left, r.ep_right,
+        r.ep_prefix_max, r.nstate,
         *r.g, *r.e, r.ctcf_cap, r.ctcf_rel, r.block_prob, *r.ls, r.lesion_block_prob,
         r.lifetime, r.lifetime_stalled, r.lifetime_rnstalled, r.lifetime_ctcf,
         r.pause_term_global, r.term_step_prob, r.stride, r.stall_prob, r.push_prob, r.headon_push_prob, r.tol,
         r.N, r.chain_length, r.nlef, r.n_genes, r.has_rnapii, r.has_lesions, r.occl,
-        block_len, do_record, (r.record_cap if r.has_rnapii else 1), (r.lcap if r.has_lesions else 1),
+        block_len, do_record, rc if do_record else (r.record_cap if r.has_rnapii else 1),
+        (r.lcap if r.has_lesions else 1),
         coh, rp, rs, ri, lp, ls)
     if not do_record:
         return None
+    if r.has_rnapii and int(r.nstate[3]) > int(r.record_cap):
+        raise RuntimeError(
+            "RNAPII recording capacity exceeded: observed "
+            f"{int(r.nstate[3])} live polymerases, but max_rnapii * num_chains "
+            f"is {int(r.record_cap)}; increase lef.max_rnapii"
+        )
     return (coh, rp if r.has_rnapii else None, rs if r.has_rnapii else None,
             ri if r.has_rnapii else None, lp if r.has_lesions else None, ls if r.has_lesions else None)

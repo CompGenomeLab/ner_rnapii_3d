@@ -8,10 +8,28 @@ from typing import List
 import h5py
 import numpy as np
 
-from ..config import LEFConfig, resolve_plugin
+from ..config import LEFConfig, _validate_scale, resolve_plugin
 from ..plugins.lef_dynamics import Cohesin
 from ..plugins.rnapii import compute_ep_contacts
 from .progress import ProgressMeter, log
+
+
+def _live_width(buf: np.ndarray) -> int:
+    """Leading column count that is ever live across a recording block.
+
+    The kernel packs live entries into the low columns ``[0:n]`` (RNAPII position /
+    lesion site ``>= 0``) and leaves the tail as ``-1`` padding. Returns the smallest
+    ``W`` such that columns ``[W:]`` are ``-1`` for every tick in the block, so writing
+    only ``buf[:, :W]`` and relying on the dataset ``fillvalue=-1`` for the untouched
+    tail is byte-identical to writing the full ``record_cap`` width -- it just skips
+    compressing the (often >99%) padding. ``buf`` is the ``(block, cap, 2)`` array whose
+    column 0 holds the position/site. Because live entries are packed contiguously this
+    equals ``(buf[:, :, 0] >= 0).sum(axis=1).max()`` (the old per-block ``max_live``),
+    so it also serves as the resize tracker (one scan instead of two)."""
+    if buf.shape[0] == 0 or buf.shape[1] == 0:
+        return 0
+    live_cols = np.flatnonzero((buf[:, :, 0] >= 0).any(axis=0))
+    return int(live_cols[-1]) + 1 if live_cols.size else 0
 
 
 def initial_state(cfg: LEFConfig, args: dict, load_fn) -> tuple[np.ndarray, List[Cohesin]]:
@@ -85,6 +103,10 @@ def _advance_one_step(
 
 def run(cfg: LEFConfig) -> Path:
     """Simulate LEF (+ optional RNAPII) dynamics and write ``LEFPositions.h5``."""
+
+    # ``run`` also accepts directly constructed LEFConfig objects, which have not
+    # passed through load_lef_config's validation.
+    _validate_scale(cfg)
 
     if cfg.seed is not None:
         np.random.seed(int(cfg.seed))
@@ -201,24 +223,28 @@ def run(cfg: LEFConfig) -> Path:
         _filter["shuffle"] = True
 
     with h5py.File(out_path, "w") as fh:
+        position_storage = dict(_filter)
+        if traj_len > 0 and n_lefs > 0:
+            position_storage["chunks"] = (_tchunk(n_lefs * 2 * 4), n_lefs, 2)
         dset = fh.create_dataset(
-            "positions",
-            shape=(traj_len, n_lefs, 2),
-            dtype=np.int32,
-            chunks=(_tchunk(n_lefs * 2 * 4), n_lefs, 2),
-            **_filter,
+            "positions", shape=(traj_len, n_lefs, 2), dtype=np.int32,
+            **position_storage,
         )
         dset_rnapii = None
         dset_states = None
         dset_ids = None
         if rnapii_enabled:
+            rn_pos_storage = dict(_filter)
+            rn_scalar_storage = dict(_filter)
+            if traj_len > 0:
+                rn_pos_storage["chunks"] = _wchunks(rnapii_cap, 8) + (2,)
+                rn_scalar_storage["chunks"] = _wchunks(rnapii_cap, 1)
             dset_rnapii = fh.create_dataset(
                 "rnapii_positions",
                 shape=(traj_len, rnapii_cap, 2),
                 maxshape=(traj_len, rnapii_cap, 2),
                 dtype=np.int32,
-                chunks=_wchunks(rnapii_cap, 8) + (2,),
-                **_filter,
+                **rn_pos_storage,
                 fillvalue=-1,
             )
             dset_states = fh.create_dataset(
@@ -226,8 +252,7 @@ def run(cfg: LEFConfig) -> Path:
                 shape=(traj_len, rnapii_cap),
                 maxshape=(traj_len, rnapii_cap),
                 dtype=np.int8,
-                chunks=_wchunks(rnapii_cap, 1),
-                **_filter,
+                **rn_scalar_storage,
                 fillvalue=-1,
             )
             # Stable per-Pol identity: the live rnapii list is compacted on unload,
@@ -238,8 +263,10 @@ def run(cfg: LEFConfig) -> Path:
                 shape=(traj_len, rnapii_cap),
                 maxshape=(traj_len, rnapii_cap),
                 dtype=np.int32,
-                chunks=_wchunks(rnapii_cap, 4),
-                **_filter,
+                **(
+                    dict(_filter, chunks=_wchunks(rnapii_cap, 4))
+                    if traj_len > 0 else _filter
+                ),
                 fillvalue=-1,
             )
 
@@ -250,20 +277,22 @@ def run(cfg: LEFConfig) -> Path:
         lesion_recorded = lesion_enabled and lesion_cap > 0
         dset_lesions = dset_lesion_types = dset_lesion_states = None
         if lesion_recorded:
+            lesion_i4_storage = dict(_filter)
+            lesion_i1_storage = dict(_filter)
+            if traj_len > 0:
+                lesion_i4_storage["chunks"] = (_tchunk(lesion_cap * 4), lesion_cap)
+                lesion_i1_storage["chunks"] = (_tchunk(lesion_cap), lesion_cap)
             dset_lesions = fh.create_dataset(
                 "lesions", shape=(traj_len, lesion_cap), dtype=np.int32,
-                chunks=(_tchunk(lesion_cap * 4), lesion_cap),
-                fillvalue=-1, **_filter,
+                fillvalue=-1, **lesion_i4_storage,
             )
             dset_lesion_types = fh.create_dataset(
                 "lesion_types", shape=(traj_len, lesion_cap), dtype=np.int8,
-                chunks=(_tchunk(lesion_cap), lesion_cap),
-                fillvalue=-1, **_filter,
+                fillvalue=-1, **lesion_i1_storage,
             )
             dset_lesion_states = fh.create_dataset(
                 "lesion_states", shape=(traj_len, lesion_cap), dtype=np.int8,
-                chunks=(_tchunk(lesion_cap), lesion_cap),
-                fillvalue=-1, **_filter,
+                fillvalue=-1, **lesion_i1_storage,
             )
 
         # Stream the trajectory in memory-bounded blocks: the kernel advances
@@ -276,22 +305,33 @@ def run(cfg: LEFConfig) -> Path:
         while start < traj_len:
             end = min(start + block_len, traj_len)
             coh_b, rp_b, rs_b, ri_b, lp_b, ls_b = advance_chunked(
-                run_state, end - start, do_record=True
+                run_state, end - start, do_record=True, compact_recording=True
             )
             dset[start:end] = coh_b
             if dset_rnapii is not None:
-                dset_rnapii[start:end] = rp_b
-                dset_states[start:end] = rs_b
-                dset_ids[start:end] = ri_b
-                # live Pols are packed low (cols [0:n]); track the max width used.
-                live = int((rp_b[:, :, 0] >= 0).sum(axis=1).max()) if rp_b.shape[0] else 0
-                if live > max_live_rnapii:
-                    max_live_rnapii = live
+                # Live Pols are packed into the low columns [0:n]; the tail is -1
+                # padding (>99% of record_cap, which is the steric ceiling). Write
+                # only the live columns and let the dataset fillvalue=-1 cover the
+                # untouched tail: byte-identical to writing the full width (the cells
+                # we skip would have been written as -1), but it skips gzip-ing the
+                # padding -- the dominant record-stage cost. w doubles as the resize
+                # tracker, so this is also the single live-width scan (was line ~287).
+                w = _live_width(rp_b)
+                if w:
+                    dset_rnapii[start:end, :w] = rp_b[:, :w]
+                    dset_states[start:end, :w] = rs_b[:, :w]
+                    dset_ids[start:end, :w] = ri_b[:, :w]
+                if w > max_live_rnapii:
+                    max_live_rnapii = w
             if dset_lesions is not None:
-                # lp_b is (block, lesion_cap, 2) = [site, type]; ls_b is [state].
-                dset_lesions[start:end] = lp_b[:, :, 0]
-                dset_lesion_types[start:end] = lp_b[:, :, 1]
-                dset_lesion_states[start:end] = ls_b
+                # lp_b is (block, lesion_cap, 2) = [site, type]; ls_b is [state]. Same
+                # live-width narrowing as RNAPII (fillvalue=-1 tail); lesion datasets
+                # are not resized, so they keep full lesion_cap width either way.
+                wl = _live_width(lp_b)
+                if wl:
+                    dset_lesions[start:end, :wl] = lp_b[:, :wl, 0]
+                    dset_lesion_types[start:end, :wl] = lp_b[:, :wl, 1]
+                    dset_lesion_states[start:end, :wl] = ls_b[:, :wl]
             rec_meter.update(end)
             start = end
 

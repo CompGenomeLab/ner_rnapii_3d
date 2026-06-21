@@ -32,7 +32,7 @@ human bands in gen_transcription_metrics.py HUMAN_RANGES. Key anchors:
               and a different (directionality) definition -- not relabeled human.
   CTCF        Per-encounter cohesin stall at a boundary ~0.06-0.18 (centered on
               Gabriele 2022 Science 12.5%); config3 strengthens it x2.5.
-  COHESIN     density 1/240 kb and base residence ~20 min, CTCF-stabilized x4
+  COHESIN     density 1/240 kb and base residence ~22.5 min, CTCF-stabilized x4
               (Gabriele 2022 Science; Hansen 2017 eLife ~22 min; Cattoglio 2019).
   CLASSES     ~20% housekeeping (Eisenberg & Levanon 2013 ~3804 HK; HRT Atlas
               ~2176), the rest cell-type / developmental; E-P distance median
@@ -83,11 +83,11 @@ RESTART_EVERY_BLOCKS = 5000          # polymer restart interval (traj snapped to
 
 # ========================== Cohesin (loop extrusion) =====================
 # Mean cohesin residence /s; lifetime_ticks = this/tick. ↑ longer-lived cohesin -> longer loops.
-# 20 min = the live-imaging base residence (Gabriele 2022 Science ~20 min; Hansen 2017
-# eLife ~22 min mESC FRAP). 25 min was the top of the measured range; 20 min is central.
-COHESIN_LIFETIME_SECONDS = 20 * 60
+# 20-25 min = the live-imaging base residence (Gabriele 2022 Science ~20 min; Hansen 2017
+# eLife ~22 min mESC FRAP). 25 min was the top of the measured range.
+COHESIN_LIFETIME_SECONDS = 22.5 * 60
 # CTCF-anchored lifetime = this * free-cohesin lifetime. ↑ stronger CTCF retention (sharper
-# boundaries / corner dots). x4 is verbatim Gabriele 2022 ("stabilized fourfold"): ~80 min boosted.
+# boundaries / corner dots). x4 is verbatim Gabriele 2022 ("stabilized fourfold"): ~80-100 min boosted.
 CTCF_LIFETIME_BOOST = 4
 
 # ====================== RNAPII transcription kinetics ====================
@@ -98,14 +98,14 @@ CTCF_LIFETIME_BOOST = 4
 # pause-site clearance -- the paused Pol occupies tss+pause_offset for ~one pause dwell, so a gene
 # re-initiates at most ~1/dwell ~2/min, i.e. completion <= ~0.5/min (productive_fraction ~0.25).
 # The geo-mean sets the typical gene; LOAD_RATE_MAX caps the active tail near those ceilings.
-RNAP_LOAD_RATE = 0.050
+RNAP_LOAD_RATE = 0.034
 # Hard cap on any single gene's loading rate /s. With the PAUSE-INITIATION LIMIT now enforced in the
 # engine (rnapii_promoter_occlusion: a paused Pol in the promoter-proximal window blocks reloading,
 # Gressel 2019; Bartman 2019), the REALISED initiation of a gene is gated by its pause-escape rate
 # (omega <= beta), not by this load cap -- so the cap can be opened to let fast-pause (CDK9-like)
 # genes reach the human hot tail (~tens/min, up to HSPA1A ~87/min) while slow-pause genes stay gated
 # low. The geo-mean still sets the typical gene; the dynamic range now emerges from pause kinetics.
-LOAD_RATE_MAX = 0.18
+LOAD_RATE_MAX = 0.10
 # Premature-termination rate /s at the pause; productive_fraction = k_release/(k_release+this).
 # ↑ more abortion -> lower productive_fraction & mRNA output. 0.025 centers productive_fraction at
 # ~0.20-0.25 (STL-seq / Mukherjee & Guertin ~20-25%); 0.034 was the high end and pinned it at ~0.16,
@@ -151,7 +151,7 @@ PAUSE_MIN_S = 25
 # Per-gene loading spread (log-normal). ↑ wider activity range: heavier active tail + more near-silent genes.
 LOAD_LOGNORM_SIGMA = 1.3
 # Per-class fraction of genes forced near-silent (cell-type/developmental off in this cell). ↑ more silent genes.
-SILENT_PROB = {"hk_const": 0.0, "hk_high": 0.0, "celltype": 0.5, "dev": 0.85}
+SILENT_PROB = {"hk_const": 0.0, "hk_high": 0.0, "celltype": 0.35, "dev": 0.72}
 LOAD_SILENT_FRAC = 0.005       # silent genes load at this x the expressed anchor; ↑ leakier (less silent)
 # Loading factor = (median_TAD_size / TAD_size)^this. ↑ stronger size->activity coupling (small TADs more active).
 LOAD_TADSIZE_EXPONENT = 0.2
@@ -195,10 +195,10 @@ DENS_POOR   = 7.0              # genes/Mb at min density; ↑ more genes in spar
 TXN_NOISE   = 0.12             # transcription<->density/size decoupling; ↑ txn less predictable from architecture
 # txn = this*(inverse TAD size) + (1-this)*density + noise. ↑ size dominates txn over density (long TADs less active).
 TAD_SIZE_TXN_WEIGHT = 0.78
-BSTR_RANGE  = (0.06, 0.18)     # CTCF boundary per-encounter cohesin-stall prob; ↑ stronger insulation.
+BSTR_RANGE  = (0.03, 0.15)     # CTCF boundary per-encounter cohesin-stall prob; ↑ stronger insulation.
                                # Centered on Gabriele 2022 Science (12.5% per-encounter stall, Fbn2 mESC);
                                # plausible in-vivo band ~0.125-0.25. Was (0.04,0.13), low vs the measured value.
-BSTR_NOISE  = 0.01             # jitter added to boundary strength; ↑ more boundary variability
+BSTR_NOISE  = 0.001             # jitter added to boundary strength; ↑ more boundary variability
 # boundary strength = this*flank_txn + (1-this)*flank_density. ↑ strength driven more by transcription than density.
 BSTR_TXN_WEIGHT = 0.5
 
@@ -221,8 +221,8 @@ FRAC = np.array([CLASSES[c]["frac"] for c in ORDER])   # documentation-only; see
 # level. Housekeeping genes are enriched in active compartments but are still a minority even
 # there (~35% of active-TAD genes); silent/gene-poor TADs are dominated by developmental +
 # off cell-type genes. The activity-weighted blend nets ~20-25% housekeeping genome-wide.
-FRAC_ACTIVE = np.array([0.22, 0.13, 0.57, 0.08])   # mix in max-txn TADs; ↑ a weight -> more of that class where active
-FRAC_POOR   = np.array([0.10, 0.02, 0.45, 0.43])   # mix in min-txn TADs; ↑ a weight -> more of that class where silent
+FRAC_ACTIVE = np.array([0.22, 0.06, 0.64, 0.08])   # mix in max-txn TADs; hk_high reduced -> ~5% "active" output class
+FRAC_POOR   = np.array([0.08, 0.01, 0.48, 0.43])   # mix in min-txn TADs; celltype-heavy -> "quiet" bulk + dev "silent"
 
 # ===================== Per-class output stratification ===================
 # The deficit in mRNA output is housekeeping-specific (the per-class QC shows hk genes far below the

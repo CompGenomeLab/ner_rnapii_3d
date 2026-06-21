@@ -1,17 +1,17 @@
 
 # Env param
 nproc=42 # Number of parallel processes during parameter search (Running multiple simulations in parallel). Adjust based on your CPU cores.
-seed=42 # Random seed for config generation. Change for different runs. Keep for paper reproducibility.
+seed=2026 # Random seed for config generation. Change for different runs. Keep for paper reproducibility.
 
 # Simulation parameters
 suffix=10k # Suffix for output folder and config files. Adjust to your liking.
 bp_per_site=250 # Lattice resolution: bp per site. Drives chain length, lesion density, all distances.
 chainlength=40000 # Number of sites on lattice, each 250bp. So 40k = 10Mb.
 warmup_steps=40000 ### Warmup for equilibration, prior to production (not recorded).
-trajectory_length=80000 ### Production simulation (recorded)
+trajectory_length=160000 ### Production simulation (recorded)
 tickseconds=2 # Number of seconds per simulation tick. At 250bp sites, a free cohesin extrudes 2 sites/tick = 500bp/tick, so 2s/tick = 250bp/s extrusion speed.
-nreplicates=20 # Simulation replicates. All run on the same topology.
-bstr_mult=3.75 # Boundary strength multiplier, increases the probability of LEF stalling at CTCF sites. One time control. It is not checked per simulation tick (resolution-independent).
+nreplicates=20 # Simulation replicates. All run on the same topology. e.g alleles.
+bstr_mult=3.25 # Boundary strength multiplier, increases the probability of LEF stalling at CTCF sites. One time control. It is not checked per simulation tick (resolution-independent).
 typea_prob=0.25 # Type A lesion probability, i.e. if a lesion spawns on a gene body, what ratio of those lesions are Type A.
 blockProb=0.99625 # Probability of Type A (during pre-repair + repair) and Type B (during repair) lesions blocking cohesin extrusion. Evaluated per tick. Per-tick prob => recomputed for 2s ticks: 1-(1-0.985)*(2/8), same physical ~0.0019/s bypass rate (~533s dwell) as 0.985 at 8s/tick.
 prerecognition_seconds=2400 # a.k.a pre-repair seconds, per tick probabilistic. Average time for a lesion to be recognized (and thus start repair). Evaluated per tick. 2400s = 40 minutes average time to recognition.
@@ -52,15 +52,15 @@ uv run python scripts/gen_cohesin_barrier_eval.py \
 
 ### Parameter sweeps --- START #####
 
-# # Boundary strength sweep (boundary strength multiplier)
+# Boundary strength sweep (boundary strength multiplier)
 uv run python scripts/sweep_rnapoff_boundary_strength_1d.py \
   --config1 configs/config1_${suffix}.yaml \
   --h5-config1 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
-  --multipliers 1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 \
+  --multipliers 1,1.5,2,2.5,3,3.5,4,4.5,5 \
   --out-dir ${outFolder}/boundary_sweep_${suffix} \
   --jobs $nproc
 
-# # Type A probability sweep (TYPE A probability vs lesion density)
+# Type A probability sweep (TYPE A probability vs lesion density)
 # uv run python scripts/gen_typea_density_grid.py \
 #   --config configs/config1_${suffix}.yaml \
 #   --h5 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \

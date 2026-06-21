@@ -199,3 +199,62 @@ def test_block_len_for_grows_with_recorded_width(all_regime_cfgs):
     assert bounds["rnapii"] <= bounds["cohesin"]
     assert bounds["lesion"] <= bounds["cohesin"]
     assert bounds["combined"] <= bounds["rnapii"]
+
+
+def test_compact_recording_buffer_equals_full_width(rnapii_cfg):
+    """The production recorder may omit only unreachable padding columns.
+
+    At most one Pol per gene loads in a tick, so the compact block width is a
+    conservative upper bound rather than an observed-data heuristic. Its values
+    must equal the full-width recorder prefix and the omitted tail must be -1.
+    """
+    cfg = copy.deepcopy(rnapii_cfg)
+    cfg.seed = 2026
+    full_run = kernel.init_chunked(cfg, build_args(cfg))
+    compact_run = kernel.init_chunked(cfg, build_args(cfg))
+    kernel.advance_chunked(full_run, WARMUP, do_record=False)
+    kernel.advance_chunked(compact_run, WARMUP, do_record=False)
+
+    full = kernel.advance_chunked(full_run, TRAJ, do_record=True)
+    compact = kernel.advance_chunked(
+        compact_run, TRAJ, do_record=True, compact_recording=True
+    )
+    width = compact[1].shape[1]
+    assert width <= full[1].shape[1]
+    for i in (1, 2, 3):
+        assert np.array_equal(compact[i], full[i][:, :width])
+        assert np.all(full[i][:, width:] == -1)
+    assert np.array_equal(compact[0], full[0])
+
+
+def test_out_of_lattice_gene_is_rejected_before_numba(rnapii_cfg):
+    """Numba indexing is unchecked, so bad absolute coordinates must fail early."""
+    cfg = copy.deepcopy(rnapii_cfg)
+    args = build_args(cfg)
+    args["genes"][0].tss = cfg.num_sites
+    with pytest.raises(ValueError, match="outside the .* lattice"):
+        kernel.init_chunked(cfg, args)
+
+
+def test_rnapii_record_capacity_overflow_is_not_silently_truncated(rnapii_cfg):
+    """A cap suitable for a small run must fail clearly if a denser run exceeds it."""
+    cfg = copy.deepcopy(rnapii_cfg)
+    cfg.max_rnapii = 1  # two chains -> only two recording columns
+    args = build_args(cfg)
+    for gene in args["genes"]:
+        gene.load_prob = 1.0
+        gene.load_requires_enhancer = False
+        gene.initiation_prob = 0.0
+    run = kernel.init_chunked(cfg, args)
+    with pytest.raises(RuntimeError, match="recording capacity exceeded"):
+        kernel.advance_chunked(run, 1, do_record=True)
+
+
+def test_failed_cohesin_reload_raises_instead_of_leaving_ghost_slot():
+    """The Numba loader must match the Python oracle when every pair is occupied."""
+    N = 4
+    occupied = np.ones(N, np.int8)
+    arrays = [np.zeros(1, dtype=dtype) for dtype in
+              (np.int64, np.int64, np.int8, np.int8, np.int8, np.int8)]
+    with pytest.raises(RuntimeError, match="No same-chain adjacent empty sites"):
+        kernel._load_one(kernel.nb_seed(1), occupied, *arrays, 0, N, N)

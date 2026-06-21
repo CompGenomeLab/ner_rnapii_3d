@@ -383,12 +383,22 @@ def measure_transcription(
         gidx[gids] = np.arange(n_genes)
 
         T = int(h["rnapii_positions"].shape[0])
+        if T == 0:
+            raise ValueError(f"{h5_path}: transcription metrics require at least one frame")
         has_lesions = "lesions" in h
         has_cohesin = "positions" in h
 
-        # Per-gene per-frame occupancy (any present Pol / engaged Pol).
-        present_ct = np.zeros((n_genes, T), dtype=np.int32)
-        engaged_ct = np.zeros((n_genes, T), dtype=np.int32)
+        # Streaming occupancy/burst accumulators. Keeping the former per-gene x
+        # per-frame matrices cost O(genes * frames) RAM (about 2.5 GiB for the
+        # panel config) even though only their sums and boolean runs are needed.
+        present_ticks = np.zeros(n_genes, dtype=np.int64)
+        engaged_ticks = np.zeros(n_genes, dtype=np.int64)
+        active_ticks = np.zeros(n_genes, dtype=np.int64)
+        inactive_ticks = np.zeros(n_genes, dtype=np.int64)
+        burst_count = np.zeros(n_genes, dtype=np.int64)
+        gap_count = np.zeros(n_genes, dtype=np.int64)
+        previous_active = np.zeros(n_genes, dtype=bool)
+        have_previous_frame = False
         state_ticks = np.zeros((n_genes, 5), dtype=np.int64)   # cols indexed by state code
         tss_pause_ct = np.zeros(n_genes, dtype=np.int64)   # Pol in [TSS, pause site]: rel in [0, pause_offset]
         pausesite_ct = np.zeros(n_genes, dtype=np.int64)   # Pol exactly at the pause site: rel == pause_offset
@@ -399,19 +409,82 @@ def measure_transcription(
         stall_cohesin = np.zeros(n_genes, dtype=np.int64)
         chip_fold = np.zeros(chain, dtype=np.float64)
         nascent_fold = np.zeros(chain, dtype=np.float64)
-        # Flat per-(frame, Pol) records collected here, then reduced per-uid with a
-        # single vectorised group-by (sorted by uid) instead of a Python per-Pol loop.
-        rec_f: list = []   # frame
-        rec_g: list = []   # gene index
-        rec_s: list = []   # state code
-        rec_p: list = []   # site
-        rec_u: list = []   # uid
+        # Per-molecule lifecycle state is needed only while a UID is live. UIDs
+        # are stable and a polymerase appears in consecutive frames until unload,
+        # so vanished UIDs can be reduced immediately instead of retaining five
+        # arrays containing every (frame, Pol) record for a global sort.
+        empty_i8 = np.empty(0, dtype=np.int64)
+        live_uid = empty_i8
+        live_gene = empty_i8
+        live_first = empty_i8
+        live_last = empty_i8
+        live_prev_pos = empty_i8
+        live_n_pre = empty_i8
+        live_n_paused = empty_i8
+        live_n_elong = empty_i8
+        live_n_term = empty_i8
+        live_pause_ep = empty_i8
+        live_adv = empty_i8
+        live_prev_paused = np.empty(0, dtype=bool)
+
+        init_ct = np.zeros(n_genes, dtype=np.int64)
+        completed_ct = np.zeros(n_genes, dtype=np.int64)
+        aborted_ct = np.zeros(n_genes, dtype=np.int64)
+        adv_sites = np.zeros(n_genes, dtype=np.int64)
+        pause_ticks = np.zeros(n_genes, dtype=np.int64)
+        pause_episodes = np.zeros(n_genes, dtype=np.int64)
+        pre_n_sum = np.zeros(n_genes, dtype=np.int64)
+        term_n_sum = np.zeros(n_genes, dtype=np.int64)
+        resid_fr_sum = np.zeros(n_genes, dtype=np.int64)
+        resid_ct = np.zeros(n_genes, dtype=np.int64)
+
+        def finalize_lifecycles(mask: np.ndarray) -> None:
+            """Reduce vanished/current-live UID rows into per-gene integer totals."""
+            if not mask.any():
+                return
+            ug = live_gene[mask]
+            first = live_first[mask]
+            last = live_last[mask]
+            npre = live_n_pre[mask]
+            npaused = live_n_paused[mask]
+            nelong = live_n_elong[mask]
+            nterm = live_n_term[mask]
+            pep = live_pause_ep[mask]
+            adv = live_adv[mask]
+            new = first > 0
+            reached = nterm > 0
+            nr = new & reached
+
+            adv_sites[:] += np.bincount(ug, weights=adv, minlength=n_genes).astype(np.int64)
+            pause_ticks[:] += np.bincount(ug, weights=npaused, minlength=n_genes).astype(np.int64)
+            pause_episodes[:] += np.bincount(ug, weights=pep, minlength=n_genes).astype(np.int64)
+            init_ct[:] += np.bincount(ug[new], minlength=n_genes).astype(np.int64)
+            completed_ct[:] += np.bincount(ug[reached], minlength=n_genes).astype(np.int64)
+            abort = new & (nelong == 0) & (npaused > 0) & ~reached
+            aborted_ct[:] += np.bincount(ug[abort], minlength=n_genes).astype(np.int64)
+            pre_n_sum[:] += np.bincount(
+                ug[new], weights=npre[new], minlength=n_genes
+            ).astype(np.int64)
+            term_n_sum[:] += np.bincount(
+                ug[reached], weights=nterm[reached], minlength=n_genes
+            ).astype(np.int64)
+            resid_fr_sum[:] += np.bincount(
+                ug[nr], weights=(last[nr] - first[nr]), minlength=n_genes
+            ).astype(np.int64)
+            resid_ct[:] += np.bincount(ug[nr], minlength=n_genes).astype(np.int64)
 
         ds_pos, ds_st, ds_id = h["rnapii_positions"], h["rnapii_states"], h["rnapii_ids"]
         ds_les = h["lesions"] if has_lesions else None
         ds_lty = h["lesion_types"] if has_lesions else None
         ds_lst = h["lesion_states"] if has_lesions else None
         ds_lef = h["positions"] if has_cohesin else None
+        widest_row = max(
+            int(ds_pos.shape[1]),
+            int(ds_les.shape[1]) if ds_les is not None else 0,
+            int(ds_lef.shape[1]) if ds_lef is not None else 0,
+            1,
+        )
+        chunk = min(max(1, int(chunk)), max(1, 2_000_000 // widest_row))
 
         for start in range(0, T, chunk):
             end = min(start + chunk, T)
@@ -427,19 +500,41 @@ def measure_transcription(
                 gf = start + k
                 site = pos[k, :, 0]
                 present = site >= 0
+                if present.any():
+                    sp = site[present]
+                    gp = gidx[pos[k, present, 1]]
+                    stp = st[k][present].astype(int)
+                    idp = ids[k][present].astype(np.int64, copy=False)
+                    per_gene_present = np.bincount(gp, minlength=n_genes)
+                else:
+                    sp = gp = stp = idp = empty_i8
+                    per_gene_present = np.zeros(n_genes, dtype=np.int64)
+
+                present_ticks += per_gene_present
+                active = per_gene_present > 0
+                active_ticks += active
+                inactive_ticks += ~active
+                if have_previous_frame:
+                    burst_count += active & ~previous_active
+                    gap_count += ~active & previous_active
+                else:
+                    burst_count += active
+                    gap_count += ~active
+                    have_previous_frame = True
+                previous_active = active
+
                 if not present.any():
+                    finalize_lifecycles(np.ones(live_uid.size, dtype=bool))
+                    live_uid = live_gene = live_first = live_last = empty_i8
+                    live_prev_pos = live_n_pre = live_n_paused = live_n_elong = empty_i8
+                    live_n_term = live_pause_ep = live_adv = empty_i8
+                    live_prev_paused = np.empty(0, dtype=bool)
                     continue
-                sp = site[present]
-                gp = gidx[pos[k, present, 1]]
-                stp = st[k][present].astype(int)
-                idp = ids[k][present]
 
                 # Histogram per gene/state with bincount (same result as np.add.at,
-                # but unbuffered scatter-add is ~10x slower). present_ct/engaged_ct
-                # columns start at 0 so a direct assign equals accumulate-from-zero.
-                present_ct[:, gf] = np.bincount(gp, minlength=n_genes)
+                # but unbuffered scatter-add is ~10x slower).
                 eng = (stp == STATE_ELONGATING) | (stp == STATE_STALLED)   # == _ENGAGED
-                engaged_ct[:, gf] = np.bincount(gp[eng], minlength=n_genes)
+                engaged_ticks += np.bincount(gp[eng], minlength=n_genes)
                 state_ticks += np.bincount(gp * 5 + stp, minlength=n_genes * 5).reshape(n_genes, 5)
                 # pausing index from 1D position: rel = distance past TSS toward TES.
                 # The pause sits at rel == pause_offset; the body is pause_offset < rel <= glen.
@@ -456,27 +551,22 @@ def measure_transcription(
                 chip_fold += np.bincount(sp % chain, minlength=chain)
                 nascent_fold += np.bincount(sp[eng] % chain, minlength=chain)
 
-                # Co-transcriptional stall attribution: paint blocking lesions and
-                # cohesin legs onto the lattice, then look one site ahead of each
-                # STALLED Pol (it stalls just upstream of the obstacle). Painting the
-                # N-wide landscape is only needed when this frame HAS a stalled Pol
-                # (the maps are read solely in the STATE_STALLED branch below); most
-                # frames have none, so skip the per-frame np.zeros(N) entirely.
+                # Co-transcriptional stall attribution: look one site ahead of each
+                # STALLED Pol (it stalls just upstream of the obstacle) and test those
+                # few sites against the active lesion/cohesin coordinates. This avoids
+                # allocating two N-wide boolean landscapes per stalled frame.
                 any_stall = bool((stp == STATE_STALLED).any())
-                les_block = None
+                blocking_lesion_sites = empty_i8
                 if has_lesions and any_stall:
                     s = les[k]
                     v = (s >= 0) & (s < N)
                     sv, tv, stv = s[v], lty[k][v], lst[k][v]
                     block = (stv == LESION_REPAIR) | (tv == LESION_TYPE_A)
-                    les_block = np.zeros(N, dtype=bool)
-                    les_block[sv[block]] = True
-                coh = None
+                    blocking_lesion_sites = sv[block]
+                cohesin_sites = empty_i8
                 if has_cohesin and any_stall:
                     legs = lef[k].reshape(-1)
-                    legs = legs[(legs >= 0) & (legs < N)]
-                    coh = np.zeros(N, dtype=bool)
-                    coh[legs] = True
+                    cohesin_sites = legs[(legs >= 0) & (legs < N)]
 
                 # Stall attribution (vectorised over the stalled Pols in this frame):
                 # a STALLED Pol stalls just upstream of its obstacle, so look one site
@@ -490,88 +580,79 @@ def measure_transcription(
                     valid = (ahead >= 0) & (ahead < N)
                     gv, av = g_st[valid], ahead[valid]
                     if gv.size:
-                        les_hit = les_block[av] if les_block is not None else np.zeros(av.size, bool)
-                        coh_hit = coh[av] if coh is not None else np.zeros(av.size, bool)
+                        les_hit = np.isin(av, blocking_lesion_sites)
+                        coh_hit = np.isin(av, cohesin_sites)
                         stall_lesion += np.bincount(gv[les_hit], minlength=n_genes)
                         stall_cohesin += np.bincount(gv[coh_hit & ~les_hit], minlength=n_genes)
 
-                # Collect this frame's records for the vectorised per-uid reduction.
-                rec_f.append(np.full(sp.size, gf, np.int64))
-                rec_g.append(gp)
-                rec_s.append(stp)
-                rec_p.append(sp)
-                rec_u.append(idp)
+                # Merge the current live UID set with the previous frame. Valid
+                # engine output is UID-sorted; tolerate external H5 writers by
+                # sorting only when needed.
+                if idp.size > 1 and np.any(idp[1:] < idp[:-1]):
+                    uid_order = np.argsort(idp, kind="stable")
+                    idp = idp[uid_order]
+                    sp = sp[uid_order]
+                    gp = gp[uid_order]
+                    stp = stp[uid_order]
 
-    # ---- reduce per-uid tracks to per-gene aggregates --------------------
-    # ---- reduce the flat per-Pol records to per-gene aggregates -------------
-    # Vectorised group-by uid: a stable sort by uid keeps each Pol's records in
-    # frame order (one record per frame), so segment-wise numpy ops reproduce the
-    # old stateful per-uid loop exactly (integer sums are order-independent; the
-    # dwell means are sum/count of integer tick-counts x tick_seconds).
-    init_ct = np.zeros(n_genes, dtype=np.int64)
-    completed_ct = np.zeros(n_genes, dtype=np.int64)
-    aborted_ct = np.zeros(n_genes, dtype=np.int64)
-    adv_sites = np.zeros(n_genes, dtype=np.int64)
-    pause_ticks = np.zeros(n_genes, dtype=np.int64)
-    pause_episodes = np.zeros(n_genes, dtype=np.int64)
-    # per-gene dwell sums (of integer tick-counts) + counts -> means at the end.
-    pre_n_sum = np.zeros(n_genes, dtype=np.int64)
-    term_n_sum = np.zeros(n_genes, dtype=np.int64)
-    resid_fr_sum = np.zeros(n_genes, dtype=np.int64)
-    resid_ct = np.zeros(n_genes, dtype=np.int64)
+                loc = np.searchsorted(live_uid, idp)
+                survived = loc < live_uid.size
+                if survived.any():
+                    survived[survived] = live_uid[loc[survived]] == idp[survived]
+                retained = np.zeros(live_uid.size, dtype=bool)
+                retained[loc[survived]] = True
+                finalize_lifecycles(~retained)
 
-    if rec_u:
-        f = np.concatenate(rec_f); g_ = np.concatenate(rec_g)
-        s = np.concatenate(rec_s); p = np.concatenate(rec_p); u = np.concatenate(rec_u)
-        order = np.argsort(u, kind="stable")           # group by uid, preserve frame order
-        u = u[order]; f = f[order]; g_ = g_[order]; s = s[order]; p = p[order]
-        n = u.size
-        seg = np.ones(n, dtype=bool)
-        seg[1:] = u[1:] != u[:-1]                       # first record of each uid
-        seg_id = np.cumsum(seg) - 1                     # compact 0..n_uid-1 per record
-        n_uid = int(seg_id[-1]) + 1
-        first = np.flatnonzero(seg)
-        last = np.empty(n_uid, dtype=np.int64)
-        last[:-1] = first[1:] - 1
-        last[-1] = n - 1
+                n_live = idp.size
+                cur_first = np.full(n_live, gf, dtype=np.int64)
+                cur_n_pre = np.zeros(n_live, dtype=np.int64)
+                cur_n_paused = np.zeros(n_live, dtype=np.int64)
+                cur_n_elong = np.zeros(n_live, dtype=np.int64)
+                cur_n_term = np.zeros(n_live, dtype=np.int64)
+                cur_pause_ep = np.zeros(n_live, dtype=np.int64)
+                cur_adv = np.zeros(n_live, dtype=np.int64)
+                previous_position = sp.copy()
+                was_paused = np.zeros(n_live, dtype=bool)
 
-        u_gene = g_[first]                              # gene at first sighting (constant per uid)
-        u_first_frame = f[first]
-        u_last_frame = f[last]
-        sc = np.bincount(seg_id * 5 + s, minlength=n_uid * 5).reshape(n_uid, 5)
-        u_n_pre = sc[:, STATE_PRE_INITIATION]
-        u_n_paused = sc[:, STATE_PAUSED]
-        u_n_elong = sc[:, STATE_ELONGATING]
-        u_n_term = sc[:, STATE_TERMINATING]
-        u_reached = u_n_term > 0                        # ever STATE_TERMINATING
-        # pause episodes = transitions into PAUSED (prev not paused, reset at uid start)
-        is_p = s == STATE_PAUSED
-        prev_p = np.zeros(n, dtype=bool)
-        prev_p[1:] = is_p[:-1]
-        prev_p[first] = False
-        u_pause_ep = np.bincount(seg_id[is_p & ~prev_p], minlength=n_uid).astype(np.int64)
-        # advancement: positive ELONGATING moves; prev_pos = own pos at uid start (adv 0)
-        prev_pos = np.empty(n, dtype=np.int64)
-        prev_pos[1:] = p[:-1]
-        prev_pos[first] = p[first]
-        adv = (p - prev_pos) * direction[g_]
-        am = (adv > 0) & (s == STATE_ELONGATING)
-        u_adv = np.bincount(seg_id[am], weights=adv[am].astype(np.float64),
-                            minlength=n_uid).astype(np.int64)
+                ci = np.flatnonzero(survived)
+                if ci.size:
+                    pi = loc[ci]
+                    cur_first[ci] = live_first[pi]
+                    cur_n_pre[ci] = live_n_pre[pi]
+                    cur_n_paused[ci] = live_n_paused[pi]
+                    cur_n_elong[ci] = live_n_elong[pi]
+                    cur_n_term[ci] = live_n_term[pi]
+                    cur_pause_ep[ci] = live_pause_ep[pi]
+                    cur_adv[ci] = live_adv[pi]
+                    previous_position[ci] = live_prev_pos[pi]
+                    was_paused[ci] = live_prev_paused[pi]
 
-        new = u_first_frame > 0                         # not present at frame 0
-        nr = new & u_reached
-        adv_sites = np.bincount(u_gene, weights=u_adv.astype(np.float64), minlength=n_genes).astype(np.int64)
-        pause_ticks = np.bincount(u_gene, weights=u_n_paused.astype(np.float64), minlength=n_genes).astype(np.int64)
-        pause_episodes = np.bincount(u_gene, weights=u_pause_ep.astype(np.float64), minlength=n_genes).astype(np.int64)
-        init_ct = np.bincount(u_gene[new], minlength=n_genes).astype(np.int64)
-        completed_ct = np.bincount(u_gene[u_reached], minlength=n_genes).astype(np.int64)
-        abort = new & (u_n_elong == 0) & (u_n_paused > 0) & ~u_reached
-        aborted_ct = np.bincount(u_gene[abort], minlength=n_genes).astype(np.int64)
-        pre_n_sum = np.bincount(u_gene[new], weights=u_n_pre[new].astype(np.float64), minlength=n_genes).astype(np.int64)
-        term_n_sum = np.bincount(u_gene[u_reached], weights=u_n_term[u_reached].astype(np.float64), minlength=n_genes).astype(np.int64)
-        resid_fr_sum = np.bincount(u_gene[nr], weights=(u_last_frame[nr] - u_first_frame[nr]).astype(np.float64), minlength=n_genes).astype(np.int64)
-        resid_ct = np.bincount(u_gene[nr], minlength=n_genes).astype(np.int64)
+                cur_n_pre += stp == STATE_PRE_INITIATION
+                cur_n_paused += stp == STATE_PAUSED
+                cur_n_elong += stp == STATE_ELONGATING
+                cur_n_term += stp == STATE_TERMINATING
+                paused_now = stp == STATE_PAUSED
+                cur_pause_ep += paused_now & ~was_paused
+                advancement = (sp - previous_position) * direction[gp]
+                advance_mask = survived & (advancement > 0) & (stp == STATE_ELONGATING)
+                cur_adv[advance_mask] += advancement[advance_mask]
+
+                live_uid = idp.copy()
+                live_gene = gp.copy()
+                live_first = cur_first
+                live_last = np.full(n_live, gf, dtype=np.int64)
+                live_prev_pos = sp.copy()
+                live_n_pre = cur_n_pre
+                live_n_paused = cur_n_paused
+                live_n_elong = cur_n_elong
+                live_n_term = cur_n_term
+                live_pause_ep = cur_pause_ep
+                live_adv = cur_adv
+                live_prev_paused = paused_now
+
+    # Reduce polymerases still live in the final recorded frame. Molecules that
+    # vanished earlier were finalized as soon as they left the live UID set.
+    finalize_lifecycles(np.ones(live_uid.size, dtype=bool))
 
     # dwell means (nan where no contributing Pol); tick_seconds applied once so the
     # result equals mean([count*tick_seconds, ...]) for the per-gene Pol set.
@@ -584,13 +665,10 @@ def measure_transcription(
     elong_ticks = state_ticks[:, STATE_ELONGATING].astype(float)
     total_ticks = state_ticks.sum(axis=1).astype(float)
 
-    def _mean(xs: list[float]) -> float:
-        return float(np.mean(xs)) if xs else float("nan")
-
     rows = []
     for g in range(n_genes):
-        occ = present_ct[g].sum() / T
-        nasc = engaged_ct[g].sum() / T
+        occ = present_ticks[g] / T
+        nasc = engaged_ticks[g] / T
         prox_window = pause_offset + 1                      # TSS through the pause site (sites)
         body_len = max(glen[g] - prox_window, 1)
         body_d = body_ct[g] / body_len
@@ -649,17 +727,20 @@ def measure_transcription(
         for code in _STATE_ORDER:
             row[f"frac_{_STATE_NAMES[code]}"] = (state_ticks[g, code] / st_tot
                                                  if st_tot == st_tot else float("nan"))
-        # bursting (from the per-gene presence timeseries)
-        active = present_ct[g] > 0
-        bursts = _runs(active)
-        gaps = _runs(~active)
-        row["active_fraction"] = float(active.mean())
-        row["burst_rate_per_min"] = len(bursts) / t_obs * 60.0
-        row["mean_burst_size"] = (init_ct[g] / len(bursts) if bursts else float("nan"))
-        row["mean_burst_duration_s"] = (_mean([(e - s) * tick_seconds for s, e in bursts])
-                                        if bursts else float("nan"))
-        row["mean_interburst_s"] = (_mean([(e - s) * tick_seconds for s, e in gaps])
-                                    if gaps else float("nan"))
+        # Bursts/gaps were counted online from the same active = occupancy > 0
+        # series. Mean run length is total True/False ticks divided by run count.
+        row["active_fraction"] = active_ticks[g] / T
+        row["burst_rate_per_min"] = burst_count[g] / t_obs * 60.0
+        row["mean_burst_size"] = (init_ct[g] / burst_count[g]
+                                  if burst_count[g] else float("nan"))
+        row["mean_burst_duration_s"] = (
+            active_ticks[g] / burst_count[g] * tick_seconds
+            if burst_count[g] else float("nan")
+        )
+        row["mean_interburst_s"] = (
+            inactive_ticks[g] / gap_count[g] * tick_seconds
+            if gap_count[g] else float("nan")
+        )
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -684,7 +765,9 @@ def _aggregate(df: pd.DataFrame, *, n_alleles: int) -> dict:
         if col in summed:
             agg[col] = float(df[col].sum())
         else:
-            agg[col] = float(np.nanmean(df[col].to_numpy(dtype=float)))
+            values = df[col].to_numpy(dtype=float)
+            non_nan = values[~np.isnan(values)]
+            agg[col] = float(non_nan.mean()) if non_nan.size else float("nan")
     agg["n_genes"] = n_alleles
     return agg
 
@@ -805,6 +888,7 @@ def plot_distributions(df: pd.DataFrame, out_path: Path, *, title: str) -> None:
     fig.suptitle(title, fontsize=15, y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.97), h_pad=3.0)
     fig.savefig(out_path, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -876,7 +960,7 @@ def plot_genome_tracks(df: pd.DataFrame, out_path: Path, *, title: str,
     fig.text(0.5, 0.004, "one point per gene at its TSS (alleles averaged); height = metric value",
              ha="center", fontsize=9, style="italic", color="#555")
     fig.tight_layout(rect=(0, 0.02, 1, 0.95))
-    fig.savefig(out_path, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(out_path, bbox_inches="tight"); fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight"); plt.close(fig)
 
 
 def plot_tracks(chip: np.ndarray, nascent: np.ndarray, genes: np.ndarray,
@@ -912,6 +996,7 @@ def plot_tracks(chip: np.ndarray, nascent: np.ndarray, genes: np.ndarray,
     fig.suptitle(title, fontsize=14, y=0.99)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_path, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight")
     plt.close(fig)
 
 

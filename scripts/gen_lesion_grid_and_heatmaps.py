@@ -221,6 +221,10 @@ def lesion_density_axis(
 
 def _p_values(p_hi: float, p_lo: float, step: float) -> list[float]:
     """p from p_hi down to p_lo (inclusive) in `step` decrements."""
+    if step <= 0:
+        raise ValueError("grid step must be positive")
+    if p_hi < p_lo:
+        raise ValueError(f"grid high bound {p_hi} is below low bound {p_lo}")
     n = int(round((p_hi - p_lo) / step))
     return [round(p_hi - i * step, 6) for i in range(n + 1)]
 
@@ -242,6 +246,8 @@ def build_grid_config(
     ``type_b_enabled`` toggles Type-B (GG-NER) lesions: when False only Type-A
     lesions are kept (the Type-A count is unchanged, no backfill)."""
     cfg = copy.deepcopy(base)
+    if int(spacing) <= 0:
+        raise ValueError(f"lesion spacing must be positive, got {spacing}")
     lef = cfg["lef"]
 
     # --- RNAPII fully off -------------------------------------------------
@@ -286,8 +292,10 @@ def metric_means(rows: list[dict]) -> dict[str, float]:
     return df.groupby("metric")["raw_value"].mean().to_dict()
 
 
-def analyze_h5(label: str, cfg_path: Path, h5_path: Path, topo: dict) -> dict[str, float]:
-    core, boundary, _aux, _lengths = analyze_run(label, cfg_path, h5_path, topo)
+def analyze_h5(label: str, cfg_path: Path, h5_path: Path, topo: dict,
+               *, positions: np.ndarray | None = None) -> dict[str, float]:
+    core, boundary, _aux, _lengths = analyze_run(label, cfg_path, h5_path, topo,
+                                                 positions=positions)
     means = metric_means(core)
     means.update(metric_means(boundary))  # identical for shared names
     return means
@@ -366,6 +374,7 @@ def _stage_frac(out: dict[str, float], tick_seconds: float,
 def measure_lesion_stall(
     h5_path: Path, tick_seconds: float, chunk: int = 2000,
     *, prerecognition_ticks: float | None = None, repair_ticks: float | None = None,
+    positions: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Measure lesion-induced cohesin stalling DIRECTLY from a 1D trajectory.
 
@@ -411,10 +420,26 @@ def measure_lesion_stall(
                 base.update(_dwell_summary([], tick_seconds, cat, 0, 1, 1))
             _stage_frac(base, tick_seconds, prerecognition_ticks, repair_ticks)
             return base
-        frames = int(h["positions"].shape[0])
-        n_lefs = int(h["positions"].shape[1])
+        # ``positions`` may be supplied by a caller that already loaded the dataset
+        # (the grid ``record`` step shares one decompress with analyze_h5); then we
+        # slice that in-memory array instead of re-reading positions from disk. The
+        # values are the same bytes, so every stall count/dwell is identical.
+        frames = int(positions.shape[0]) if positions is not None else int(h["positions"].shape[0])
+        n_lefs = int(positions.shape[1]) if positions is not None else int(h["positions"].shape[1])
         ds_sites, ds_states, ds_types = h["lesions"], h["lesion_states"], h["lesion_types"]
-        ds_pos = h["positions"]
+        ds_pos = h["positions"] if positions is None else None
+        if frames == 0:
+            raise ValueError(f"{h5_path}: lesion-stall metrics require at least one frame")
+        if positions is not None and (
+            positions.ndim != 3 or positions.shape[2] != 2
+            or positions.shape[:2] != h["positions"].shape[:2]
+        ):
+            raise ValueError(
+                f"positions shape {positions.shape} does not match H5 positions "
+                f"shape {h['positions'].shape}"
+            )
+        widest_row = max(int(ds_sites.shape[1]), n_lefs, 1)
+        chunk = min(max(1, int(chunk)), max(1, 2_000_000 // widest_row))
 
         stalled = lesions_tot = blocking_tot = 0
         # Overall continuous stall (any blocking lesion).
@@ -433,28 +458,39 @@ def measure_lesion_stall(
             sites = ds_sites[start:end]
             states = ds_states[start:end]
             types = ds_types[start:end]
-            pos = ds_pos[start:end]
+            pos = positions[start:end] if positions is not None else ds_pos[start:end]
             for k in range(end - start):
                 s, st, ty = sites[k], states[k], types[k]
                 valid = (s >= 0) & (s < N)
                 s, st, ty = s[valid], st[valid], ty[valid]
                 lesions_tot += s.size
 
-                # Paint each site with its blocking-regime category code.
-                catmap = np.zeros(N, dtype=np.int8)
+                # Recorded lesions are site-sorted. Build parallel category codes
+                # and query only the two next-step sites of each LEF via binary
+                # search, rather than zero-filling an N-wide map every frame.
+                if s.size > 1 and np.any(s[1:] < s[:-1]):
+                    order = np.argsort(s, kind="stable")
+                    s, st, ty = s[order], st[order], ty[order]
+                site_categories = np.zeros(s.size, dtype=np.int8)
                 if not rnapii:
-                    catmap[s[(ty == _LES_TYPE_A) & (st == _LES_STATE_PRE)]] = _CAT_A_PRE
-                catmap[s[(ty == _LES_TYPE_A) & (st == _LES_STATE_REPAIR)]] = _CAT_A_REPAIR
-                catmap[s[(ty == _LES_TYPE_B) & (st == _LES_STATE_REPAIR)]] = _CAT_B_REPAIR
-                blocking_tot += int((catmap > 0).sum())
+                    site_categories[(ty == _LES_TYPE_A) & (st == _LES_STATE_PRE)] = _CAT_A_PRE
+                site_categories[(ty == _LES_TYPE_A) & (st == _LES_STATE_REPAIR)] = _CAT_A_REPAIR
+                site_categories[(ty == _LES_TYPE_B) & (st == _LES_STATE_REPAIR)] = _CAT_B_REPAIR
+                blocking_tot += int((site_categories > 0).sum())
 
                 left = pos[k, :, 0]
                 right = pos[k, :, 1]
                 legcat = np.zeros((n_lefs, 2), dtype=np.int8)  # blocking category at each leg's next site
                 l_ok = (left % chain) != 0           # left leg's -1 step stays in-chain
                 r_ok = ((right + 1) % chain) != 0    # right leg's +1 step stays in-chain
-                legcat[l_ok, 0] = catmap[left[l_ok] - 1]
-                legcat[r_ok, 1] = catmap[right[r_ok] + 1]
+                for target, ok, side in ((left - 1, l_ok, 0), (right + 1, r_ok, 1)):
+                    query = target[ok]
+                    idx = np.searchsorted(s, query)
+                    found = idx < s.size
+                    if found.any():
+                        found[found] = s[idx[found]] == query[found]
+                    dest = np.flatnonzero(ok)
+                    legcat[dest[found], side] = site_categories[idx[found]]
                 blocked = legcat > 0
                 stalled += int(blocked.sum())
                 for c in _CATEGORIES.values():
@@ -622,6 +658,7 @@ def plot_heatmaps(
     fig.suptitle(title, fontsize=13, y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_path)  # format inferred from the file suffix
+    fig.savefig(out_path.with_suffix(".png"))  # format inferred from the file suffix
     plt.close(fig)
 
 

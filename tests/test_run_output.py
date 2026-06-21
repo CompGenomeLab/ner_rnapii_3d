@@ -228,3 +228,65 @@ def test_positions_equal_kernel_record_zero_warmup(rnapii_cfg, tmp_path):
     with h5py.File(out, "r") as fh:
         on_disk = fh["positions"][...]
     assert np.array_equal(on_disk, rec["coh"])
+
+
+# --------------------------------------------------------------------------- #
+# live-width narrowed write is lossless: the on-disk RNAPII / lesion values equal
+# the FULL-WIDTH kernel buffers (run() writes only the live columns and relies on
+# the dataset fillvalue=-1 for the padded tail -- this must drop nothing).
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("regime", ["rnapii", "combined"])
+def test_rnapii_ondisk_equals_full_width_buffer(all_regime_cfgs, regime, tmp_path):
+    """run() narrows the RNAPII write to the live columns (rest = fillvalue -1). Prove
+    it is byte-identical to the full-width reference: the on-disk arrays equal the
+    kernel buffers sliced to the on-disk width, AND every column the write dropped was
+    -1 in the full-width buffer (so nothing live was lost)."""
+    cfg = _prep(all_regime_cfgs[regime], tmp_path, name=f"{regime}_rn_lossless.h5")
+    out = _run(cfg)
+    rec = kernel_record(cfg, cfg.warmup_steps, cfg.trajectory_length)
+    with h5py.File(out, "r") as fh:
+        rp, rs, ri = fh["rnapii_positions"][...], fh["rnapii_states"][...], fh["rnapii_ids"][...]
+    w = rp.shape[1]
+    assert np.array_equal(rp, rec["rp"][:, :w])
+    assert np.array_equal(rs, rec["rs"][:, :w])
+    assert np.array_equal(ri, rec["ri"][:, :w])
+    # the dropped tail columns were entirely -1 padding in the full-width buffer.
+    assert np.all(rec["rp"][:, w:] == -1)
+    assert np.all(rec["rs"][:, w:] == -1)
+    assert np.all(rec["ri"][:, w:] == -1)
+
+
+@pytest.mark.parametrize("regime", ["lesion", "combined"])
+def test_lesion_ondisk_equals_full_width_buffer(all_regime_cfgs, regime, tmp_path):
+    """Lesion datasets keep full lesion_cap width, but run() still writes only the live
+    columns (fillvalue -1 tail); the on-disk arrays must equal the full-width buffers."""
+    cfg = _prep(all_regime_cfgs[regime], tmp_path, name=f"{regime}_les_lossless.h5")
+    out = _run(cfg)
+    rec = kernel_record(cfg, cfg.warmup_steps, cfg.trajectory_length)
+    with h5py.File(out, "r") as fh:
+        lp, lt, ls = fh["lesions"][...], fh["lesion_types"][...], fh["lesion_states"][...]
+    assert np.array_equal(lp, rec["lp"])
+    assert np.array_equal(lt, rec["lt"])
+    assert np.array_equal(ls, rec["ls"])
+
+
+def test_zero_length_trajectory_writes_empty_datasets(rnapii_cfg, tmp_path):
+    """A zero-step recording is valid and must not produce invalid chunk shapes."""
+    cfg = _prep(rnapii_cfg, tmp_path, warmup=3, traj=0, name="empty_time.h5")
+    out = _run(cfg)
+    with h5py.File(out, "r") as fh:
+        assert fh["positions"].shape == (0, cfg.num_lefs, 2)
+        assert fh["rnapii_positions"].shape == (0, 1, 2)
+        assert fh["rnapii_states"].shape == (0, 1)
+        assert fh["rnapii_ids"].shape == (0, 1)
+
+
+def test_zero_lef_sparse_config_writes_empty_position_axis(cohesin_cfg, tmp_path):
+    """A lattice may intentionally contain no cohesin when separation exceeds N."""
+    cfg = _prep(cohesin_cfg, tmp_path, traj=4, name="zero_lefs.h5")
+    cfg.separation = cfg.num_sites + 1
+    out = _run(cfg)
+    with h5py.File(out, "r") as fh:
+        assert cfg.num_lefs == 0
+        assert fh["positions"].shape == (4, 0, 2)
+        assert fh["positions"][...].size == 0

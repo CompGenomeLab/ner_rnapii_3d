@@ -429,6 +429,7 @@ def plot_heatmaps(
     # bbox_inches="tight" expands the saved canvas to include the now-larger axis
     # tick labels so none are clipped at the figure edge.
     fig.savefig(out_path, format="svg", bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".png"), format="png", bbox_inches="tight")
     plt.close(fig)
 
 
