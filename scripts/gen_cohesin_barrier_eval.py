@@ -1,41 +1,9 @@
 #!/usr/bin/env python
-"""Banigan-style evaluation of RNAPII as a moving barrier to cohesin.
+"""Banigan-style (Banigan et al. 2023) evaluation of RNAPII as a moving barrier to cohesin.
 
-Companion to ``gen_transcription_metrics.py`` (which measures the Pol II side).
-This measures the COHESIN side of the RNAPII<->cohesin interference -- the actual
-result of Banigan et al. 2023 (PNAS, "Transcription shapes 3D chromatin
-organization by interacting with loop extrusion"): translocating RNAP is a moving
-barrier that obstructs, slows and pushes cohesin, so cohesin ACCUMULATES at active
-promoters and is RELOCALIZED toward gene 3' ends.
-
-The signal is the DIFFERENCE between transcription ON and a matched RNAPII-OFF
-control (same cohesin parameters, ``max_rnapii: 0``, rnapii plugins nulled): any
-cohesin structure that is present ON but absent OFF is caused by transcription,
-not by CTCF boundaries that happen to sit near genes. The control is auto-derived
-and run unless ``--no-control`` (or an explicit ``--control-h5``) is given.
-
-Measured from the 1D trajectory (``positions`` = cohesin legs, ``genes`` table,
-and ``rnapii_positions`` for per-gene activity):
-
-  * Cohesin occupancy meta-profiles, ORIENTED 5'->3' (TSS on the left, TES on the
-    right), anchored three ways:
-      - TSS-anchored   (promoter accumulation; the Banigan "barrier at the 5' end")
-      - TES-anchored   (3' accumulation from terminating Pol II; relocalization)
-      - body-scaled    (TSS..TES rescaled to [0,1] with flanks; the whole gene)
-    Each is reported as ENRICHMENT = occupancy / genome-mean occupancy, for ON,
-    OFF, and ON-OFF.
-  * Activity dependence: meta-profiles split into the most- vs least-transcribed
-    gene terciles (by measured Pol II occupancy), and a per-gene scatter of
-    cohesin enrichment vs Pol II occupancy with Pearson/Spearman correlation --
-    Banigan predicts accumulation that SCALES with transcription.
-
-Outputs (to ``--out-dir``):
-
-  * ``cohesin_barrier_metagene.svg``   TSS/TES/body-scaled enrichment, ON vs OFF.
-  * ``cohesin_barrier_activity.svg``   active vs silent metagene + enrichment-vs-
-                                        activity scatter.
-  * ``cohesin_barrier_profiles.tsv``   the metagene curves (ON/OFF/diff).
-  * ``cohesin_barrier_per_gene.tsv``   per-gene cohesin enrichment + Pol occupancy.
+Measures cohesin enrichment around genes from the 1D trajectory: TSS/TES-anchored
+and body-scaled meta-profiles (transcription ON vs a matched RNAPII-OFF control)
+plus activity dependence, written as SVGs and TSVs under ``--out-dir``.
 """
 from __future__ import annotations
 
@@ -64,24 +32,16 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from compare_config_chain_metrics import _resolve_h5, _safe_label  # noqa: E402
 
-# RNAPII state codes that carry a transcript / are present at all -- only used to
-# weight per-gene activity; any present Pol II counts for occupancy.
-
 
 def read_cohesin_occupancy(h5_path: Path, chunk: int = 2000):
-    """Time-averaged cohesin-leg occupancy per lattice site.
-
-    Returns ``(occ, genome_mean, genes, N, chain, num_chains, T, rnapii_enabled)``
-    where ``occ[s]`` is the mean number of cohesin legs (either leg of any LEF)
-    sitting at site ``s`` per tick."""
+    """Time-averaged cohesin-leg occupancy per lattice site (mean legs at each site per tick)."""
     with h5py.File(h5_path, "r") as h:
         N = int(h.attrs["N"])
         chain = int(h.attrs["chain_length"])
         num_chains = int(h.attrs.get("num_chains", 1))
         rnapii = bool(h.attrs.get("rnapii_enabled", False))
         # The `genes` dataset is only written for RNAPII-enabled runs; an OFF
-        # control has none. Callers that need the gene table read the ON run; here
-        # we just return None so the control can reuse the ON topology.
+        # control has none (returns None so the control reuses the ON topology).
         genes = h["genes"][:] if "genes" in h else None
         ds = h["positions"]                       # (T, n_lefs, 2) = [left, right] leg sites
         T = int(ds.shape[0])
@@ -92,15 +52,14 @@ def read_cohesin_occupancy(h5_path: Path, chunk: int = 2000):
         for start in range(0, T, chunk):
             legs = ds[start:min(start + chunk, T)].reshape(-1)
             legs = legs[(legs >= 0) & (legs < N)]
-            occ += np.bincount(legs, minlength=N)      # == np.add.at(occ, legs, 1.0), faster
+            occ += np.bincount(legs, minlength=N)
         occ /= T
     genome_mean = float(occ.mean()) or 1.0
     return occ, genome_mean, genes, N, chain, num_chains, T, rnapii
 
 
 def read_pol_occupancy_per_gene(h5_path: Path, genes, chunk: int = 2000):
-    """Mean Pol II present per tick at each gene (its trajectory activity).
-    Returns an array aligned to ``genes`` rows, or None if RNAPII is disabled."""
+    """Mean Pol II present per tick at each gene, aligned to ``genes`` rows (None if RNAPII disabled)."""
     gids = genes["gene_id"].astype(int)
     gidx = np.full(int(gids.max()) + 1, -1, dtype=np.int64)
     gidx[gids] = np.arange(len(gids))
@@ -118,7 +77,7 @@ def read_pol_occupancy_per_gene(h5_path: Path, genes, chunk: int = 2000):
             site = block[:, :, 0]
             present = site >= 0
             g = gidx[block[:, :, 1][present]]
-            occ += np.bincount(g, minlength=len(gids))   # == np.add.at(occ, g, 1.0), faster
+            occ += np.bincount(g, minlength=len(gids))
         occ /= T
     return occ
 
@@ -135,11 +94,9 @@ def build_control_config(base: dict) -> dict:
 
 
 def _oriented_profile(occ, genes, N, chain, *, flank, gene_mask=None):
-    """TSS- and TES-anchored mean cohesin occupancy, oriented 5'->3'.
+    """TSS- and TES-anchored mean cohesin occupancy, oriented 5'->3' (+offset is downstream/toward 3').
 
-    Offset ``d`` runs -flank..+flank in the transcription direction (so +d is
-    downstream / toward 3'). Sites crossing a chain boundary are dropped per
-    offset. Returns ``(offsets, tss_mean, tes_mean)`` (occupancy, not enrichment)."""
+    Sites crossing a chain boundary are dropped per offset. Returns occupancy, not enrichment."""
     offsets = np.arange(-flank, flank + 1)
     tss_sum = np.zeros(offsets.size); tss_cnt = np.zeros(offsets.size)
     tes_sum = np.zeros(offsets.size); tes_cnt = np.zeros(offsets.size)
@@ -159,8 +116,7 @@ def _oriented_profile(occ, genes, N, chain, *, flank, gene_mask=None):
 
 
 def _scaled_metagene(occ, genes, N, chain, *, flank, nbody, gene_mask=None):
-    """Body-scaled metagene: upstream flank (sites) | TSS..TES rescaled to nbody
-    bins | downstream flank. Returns the mean occupancy vector and the x-axis."""
+    """Body-scaled metagene: upstream flank (sites) | TSS..TES rescaled to nbody bins | downstream flank."""
     up = np.zeros(flank); up_c = np.zeros(flank)
     body = np.zeros(nbody); body_c = np.zeros(nbody)
     dn = np.zeros(flank); dn_c = np.zeros(flank)
@@ -197,8 +153,7 @@ def _scaled_metagene(occ, genes, N, chain, *, flank, nbody, gene_mask=None):
 
 
 def per_gene_enrichment(occ, genes, genome_mean, N, chain, *, promoter=5):
-    """Per-gene cohesin enrichment over genome mean, for the gene body and the
-    promoter-proximal window (``promoter`` sites downstream of the TSS)."""
+    """Per-gene cohesin enrichment over genome mean, for the gene body, promoter window, and TES window."""
     body_e = np.full(len(genes), np.nan)
     prom_e = np.full(len(genes), np.nan)
     tes_e = np.full(len(genes), np.nan)
@@ -231,16 +186,12 @@ _ON_LAB, _OFF_LAB = "transcription ON (baseline)", "transcription OFF (control)"
 
 
 def _enrich_axis(ax, *, baseline=1.0):
-    """Common styling: a labelled 'genome average' reference line."""
     ax.axhline(baseline, color="#999", lw=0.9, ls="--", zorder=1)
     ax.tick_params(labelsize=9.5)
 
 
 def plot_metagene(x_tss, x_tes, xs_scaled, on, off, flank, out_path, *, title, bp_per_site=1000):
-    """Publication figure: average cohesin enrichment around genes (a 'meta-gene'),
-    transcription ON vs OFF, plus the ON-OFF difference -- the cohesin redistribution
-    CAUSED by transcription (Banigan moving-barrier). Enrichment = cohesin-leg
-    occupancy / genome-mean, so 1.0 = genome average, >1 = cohesin enriched."""
+    """Meta-gene cohesin enrichment around genes, transcription ON vs OFF, plus the ON-OFF difference (Banigan moving-barrier)."""
     ncol = 4 if off is not None else 3
     fig, axes = plt.subplots(1, ncol, figsize=(4.6 * ncol, 5.1))
     # offsets are in lattice sites; convert the x-axis to kb for display
@@ -304,9 +255,7 @@ def plot_metagene(x_tss, x_tes, xs_scaled, on, off, flank, out_path, *, title, b
 
 def plot_activity(xs_scaled, active_prof, silent_prof, pol_density, body_e, out_path, *,
                   title, pearson, spearman):
-    """Publication figure: does cohesin accumulation scale with transcription?
-    (Banigan: it should.) Left -- cohesin meta-gene for the most- vs least-transcribed
-    genes. Right -- per-gene cohesin enrichment vs Pol II density (polymerases per kb)."""
+    """Does cohesin accumulation scale with transcription? (Banigan): activity-split meta-gene + per-gene enrichment-vs-density scatter."""
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5.2))
     a1.plot(xs_scaled, active_prof, color=_ON_C, lw=2.2, label="most-transcribed genes (top ⅓)")
     a1.plot(xs_scaled, silent_prof, color=_OFF_C, lw=2.0, label="least-transcribed genes (bottom ⅓)")
@@ -412,11 +361,8 @@ def main() -> None:
                             nbody=args.nbody, gene_mask=active_mask)
     _, sil_prof = _profiles(occ_on, genes, gm_on, N, chain, flank=args.flank,
                             nbody=args.nbody, gene_mask=silent_mask)
-    # Per-gene Pol II density (polymerases per kb): occupancy normalised by gene
-    # length. Cohesin body enrichment is itself a density (mean over the body), so
-    # this is the apples-to-apples transcription axis for the per-gene scatter and
-    # its correlation -- and it controls for the fact that longer genes hold more
-    # polymerases at the same elongation rate.
+    # Pol II density (polymerases per kb): occupancy normalised by gene length, to
+    # control for longer genes holding more polymerases at the same elongation rate.
     gene_len_kb = (np.abs(genes["tes"].astype(np.int64) - genes["tss"].astype(np.int64)) + 1) \
         * (bp_per_site / 1000.0)
     pol_density = pol_occ / gene_len_kb

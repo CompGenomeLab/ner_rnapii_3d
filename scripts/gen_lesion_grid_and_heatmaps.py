@@ -1,64 +1,32 @@
 #!/usr/bin/env python
 """Lesion grid-search generator + per-metric heatmaps vs a baseline 1D sim.
 
-Given ONE config + its ``LEFPositions.h5`` (the baseline 1D LEF run), this
-script derives a 2-D grid of NEW configs that share the baseline's TAD skeleton
-and genes but differ in two ways:
+From ONE config + its baseline ``LEFPositions.h5``, derive a 2-D grid of configs
+that share the baseline TAD skeleton/genes but ablate RNAPII (``max_rnapii: 0``,
+``rnapii_load`` / ``rnapii_translocate`` nulled) and boost every boundary strength
+by ``--bstr-mult`` (capped at 1.0). Grid axes:
 
-  * RNAPII is fully ablated: ``max_rnapii: 0`` and the ``rnapii_load`` /
-    ``rnapii_translocate`` plugin slots are nulled.
-  * Every boundary strength (per-TAD ``left_strength`` / ``right_strength`` plus
-    ``default_boundary_strength``) is multiplied by ``--bstr-mult`` (default 3)
-    and capped at 1.0.
+  Y -- ``lesion_block_prob`` (``p``): per-tick probability a lesion holds a cohesin
+       leg (bypass ``1 - p``). The realized stall saturates (the lesion is REMOVED
+       on repair and a held leg can unload), so no closed form is used -- the stall
+       is MEASURED directly; analytic seconds columns are kept only as reference.
+  X -- lesion DENSITY in lesions/Mbp via ``lesion_spacing`` (lattice sites);
+       density = ``1e6 / (spacing * bp_per_site)`` (independent of chain length),
+       ``bp_per_site`` read from the config.
 
-The grid axes (independent variables) are:
-
-  Y -- ``lesion_block_prob`` (``p``), the swept config knob itself: a lesion holds
-       a cohesin leg with per-tick probability ``p`` (bypass probability
-       ``1 - p``). ``p`` is swept 1.0 -> 0.8 in 0.025 steps. Earlier versions put
-       a derived "stall time in seconds" on this axis, but no closed form is
-       trustworthy here: a Type-B lesion only blocks while in its REPAIR state and
-       is then REMOVED, and a held leg can also unload, so the realized stall
-       saturates rather than tracking ``tick/(1-p)``. Instead of trusting a
-       formula we MEASURE the stall directly (see below). Reference seconds
-       columns (analytic effective stall and naive bypass) are still written to
-       the fold TSV.
-
-Two figures are produced:
-
-  * ``lesion_grid_heatmaps`` -- per metric, grid mean / BASELINE mean (fold,
-    colour centred at 1).
-  * ``lesion_grid_measured_stall`` -- lesion-induced cohesin stall MEASURED from
-    each run's trajectory (a leg is stalled when its next extrusion site holds a
-    blocking lesion), as per-lesion OCCUPANCY. NOT vs baseline; no stall formula.
-  * ``lesion_grid_measured_stall_seconds`` -- the realized stall DURATION in
-    SECONDS (mean + median per stall event), measured as runs of consecutive
-    blocked frames x ``tick_seconds``. This is the concrete "how long is a cohesin
-    stalled at a lesion" answer. See :func:`measure_lesion_stall`. The measured
-    TSV also carries p90/max/n_events and the analytic effective-stall reference.
-    Disable both with ``--no-measure``.
-
-  X -- lesion DENSITY in lesions/Mbp, set via ``lesion_spacing`` (in lattice
-       sites). The steady state holds ``num_sites // spacing`` lesions; the density
-       is ``1e6 / (spacing * bp_per_site)`` lesions/Mbp (independent of chain
-       length), where ``bp_per_site`` is read from the config (default 1000 for the
-       legacy 1 kb/site lattice). At 1 kb/site, ``spacing`` swept over {10, 25, 50,
-       100, 150, 200} -> {100, 40, 20, 10, 6.67, 5} lesions/Mbp (6 columns).
-
-For every grid config the 1D LEF stage is run (or an existing matching H5 is
-reused), the same per-replicate-chain metrics used by
-``compare_config_chain_metrics.py`` are computed, and each metric's chain-mean is
-divided by the BASELINE config's chain-mean (the input config + its H5). One
-heatmap per metric is drawn with the colour bar centred at 1.0 (fold = 1 means
-"same as the baseline 1D sim").
+For each grid config the 1D LEF stage is run (or a matching H5 reused), the
+``compare_config_chain_metrics.py`` per-chain metrics are computed, and each
+metric's chain-mean is divided by the BASELINE chain-mean. Figures: fold heatmaps
+(centred at 1.0) plus, unless ``--no-measure``, measured cohesin-stall heatmaps
+(per-lesion occupancy and dwell DURATION in seconds; see
+:func:`measure_lesion_stall`).
 """
 from __future__ import annotations
 
 import os
 
-# Pin BLAS/OpenMP to one thread BEFORE numpy is imported so that running many 1D
-# sims under --jobs does not oversubscribe cores (each grid point is numpy-light;
-# parallelism comes from running whole sims concurrently, not threaded BLAS).
+# Pin BLAS/OpenMP to one thread BEFORE numpy is imported so --jobs sims do not
+# oversubscribe cores; parallelism comes from concurrent sims, not threaded BLAS.
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
@@ -79,14 +47,12 @@ import pandas as pd
 import yaml
 from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize, TwoSlopeNorm
 
-# Diverging fold-change colormap shared with sweep_rnapoff_boundary_strength_1d.py:
-# slate-blue (below baseline) -> white (fold = 1.0, the TwoSlopeNorm centre) ->
-# brick-red (above baseline). Used for every "fold vs baseline" heatmap.
+# Diverging fold-change colormap: slate-blue (below baseline) -> white
+# (fold = 1.0, the TwoSlopeNorm centre) -> brick-red (above baseline).
 FOLD_CMAP = LinearSegmentedColormap.from_list(
     "fold_slate_red", ["#465775", "#ffffff", "#A63446"]
 )
-# Single-hue sequential map for the non-centered (no natural midpoint) heatmaps:
-# white at the data minimum -> brick-red at the maximum (same red as FOLD_CMAP).
+# Sequential map for the non-centered (no natural midpoint) heatmaps.
 SEQ_CMAP = LinearSegmentedColormap.from_list(
     "seq_white_red", ["#ffffff", "#A63446"]
 )
@@ -94,8 +60,8 @@ SEQ_CMAP = LinearSegmentedColormap.from_list(
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Reuse the exact topology + metric machinery from the comparison script so the
-# grid folds are computed identically to the pairwise comparison.
+# Reuse the comparison script's topology + metric machinery so grid folds are
+# computed identically to the pairwise comparison.
 from compare_config_chain_metrics import (  # noqa: E402
     BOUNDARY_LABELS,
     CORE_LABELS,
@@ -115,8 +81,8 @@ DEFAULT_TYPE_A_PROB = 0.25
 DEFAULT_TAD_SIZE_EXPONENT = 1.0
 DEFAULT_TAD_REPAIR_EXPONENT = 1.0
 
-# Metrics to draw, in display order. The union of the core + boundary sets used
-# by compare_config_chain_metrics.py, de-duplicated (some names live in both).
+# Metrics to draw, in display order: the de-duplicated union of the core +
+# boundary sets used by compare_config_chain_metrics.py.
 METRIC_LABELS: dict[str, str] = {}
 for _src in (CORE_LABELS, BOUNDARY_LABELS):
     for _k, _v in _src.items():
@@ -124,9 +90,8 @@ for _src in (CORE_LABELS, BOUNDARY_LABELS):
 
 
 def raw_bypass_seconds(p: float, tick_seconds: float) -> float:
-    """Naive mean time to *stochastically* bypass a persistent lesion (s):
-    tick / (1 - p). Diverges as p -> 1. This is the OLD y-axis and it is wrong
-    as a stall time because it assumes the lesion never disappears."""
+    """Naive mean time to stochastically bypass a persistent lesion: tick/(1-p)
+    (reference only; assumes the lesion never disappears, so it diverges at p=1)."""
     if p >= 1.0:
         return float("inf")
     return float(tick_seconds) / (1.0 - p)
@@ -138,22 +103,13 @@ def effective_stall_seconds(
     repair_ticks: float,
     lifetime_stalled_ticks: float | None = None,
 ) -> float:
-    """Mean time a cohesin leg is ACTUALLY held at a lesion (s).
+    """Mean time a cohesin leg is actually held at a lesion (s).
 
-    A Type-B lesion only blocks a cohesin leg while it is in the REPAIR state;
-    the block is leaky (per-tick bypass probability ``1 - p``) and the lesion is
-    *removed* when repair completes (mean ``repair_ticks``). A held leg can also
-    unload via the cohesin stalled lifetime (mean ``lifetime_stalled_ticks``).
-
-    These are independent memory-less escapes, so their per-tick hazards add and
-    the realized stall is their reciprocal sum::
-
-        rate = (1 - p)/tick + 1/repair_seconds [+ 1/lifetime_stalled_seconds]
-        stall = 1 / rate
-
-    Unlike :func:`raw_bypass_seconds` this SATURATES: as ``p -> 1`` the bypass
-    term vanishes and the stall is capped by lesion repair (and, if included, the
-    cohesin lifetime) instead of diverging."""
+    Three independent memory-less escapes (leaky bypass ``1 - p``, lesion repair
+    removal at mean ``repair_ticks``, and optional cohesin unload at
+    ``lifetime_stalled_ticks``) have additive per-tick hazards; the stall is their
+    reciprocal sum, so it saturates as ``p -> 1`` (capped by repair) rather than
+    diverging like :func:`raw_bypass_seconds`."""
     rate = (1.0 - p) / float(tick_seconds) + 1.0 / (float(repair_ticks) * float(tick_seconds))
     if lifetime_stalled_ticks:
         rate += 1.0 / (float(lifetime_stalled_ticks) * float(tick_seconds))
@@ -161,21 +117,16 @@ def effective_stall_seconds(
 
 
 def density_per_mbp(spacing: int, bp_per_site: int = 1000) -> float:
-    """Lesions/Mbp for a given spacing (in lattice sites). One lesion every
-    ``spacing`` sites is ``1e6 / (spacing * bp_per_site)`` lesions per Mbp; for the
-    legacy 1 kb/site lattice this reduces to ``1000/spacing``."""
+    """Lesions/Mbp for a spacing in lattice sites: ``1e6/(spacing*bp_per_site)``."""
     return 1e6 / (float(spacing) * float(bp_per_site))
 
 
 def gene_body_mass(base: dict, tad_size_exponent: float) -> float:
-    """Fraction of the TAD-weighted placement mass that lands in gene bodies for
-    the baseline genes + TAD layout.
+    """Fraction of the TAD-weighted placement mass landing in gene bodies.
 
-    Mirrors ``lesions.precompute_lesion_fields`` (gene_body_mass = sum of
-    ``lesion_site_p`` over gene-body sites). With Type-B disabled only gene-body
-    lesions can be Type A, so the realised Type-A density is
-    ``total_density * gene_body_mass * type_a_prob``. Constant across a grid (it
-    depends only on the genes, TAD layout and ``tad_size_exponent``)."""
+    Mirrors ``lesions.precompute_lesion_fields`` (sum of ``lesion_site_p`` over
+    gene-body sites). With Type-B disabled only gene-body lesions can be Type A, so
+    realised Type-A density = ``total_density * gene_body_mass * type_a_prob``."""
     from ner_rnapii_3d.plugins.lesions import _tad_length_per_site
 
     lef = base["lef"]
@@ -208,13 +159,10 @@ def lesion_density_axis(
     type_a_prob: float = 1.0,
     bp_per_site: int = 1000,
 ) -> list[float]:
-    """Per-column x-axis lesion density for the heatmaps.
+    """Per-column x-axis lesion density.
 
-    Type-B enabled -> TOTAL lesion density (``1e6/(spacing*bp_per_site)``), as usual.
-    Type-B disabled -> Type-A lesion density ``total * gbm * type_a_prob`` (only
-    gene-body lesions can be Type A). Pass ``type_a_prob=1.0`` when P(A) is itself a
-    grid axis to get the per-column gene-body (Type-A-eligible) density, scaled per
-    row by the y-axis."""
+    Type-B enabled -> TOTAL density. Type-B disabled -> Type-A density
+    ``total * gbm * type_a_prob`` (only gene-body lesions can be Type A)."""
     factor = 1.0 if type_b_enabled else float(gbm) * float(type_a_prob)
     return [density_per_mbp(sp, bp_per_site) * factor for sp in sp_sorted]
 
@@ -240,11 +188,10 @@ def build_grid_config(
     lesion_defaults: dict,
     type_b_enabled: bool = True,
 ) -> dict:
-    """Return a deep-copied config with RNAPII off, boosted boundaries, and the
-    lesion block-prob / spacing set for one grid point. ``type_a_prob`` is a
-    strict, fixed override applied to every config (like ``bstr_mult``).
-    ``type_b_enabled`` toggles Type-B (GG-NER) lesions: when False only Type-A
-    lesions are kept (the Type-A count is unchanged, no backfill)."""
+    """Deep-copied config with RNAPII off, boosted boundaries, and the lesion
+    block-prob / spacing set for one grid point. ``type_a_prob`` is a strict
+    override applied to every config; ``type_b_enabled=False`` keeps only Type-A
+    lesions (Type-A count unchanged, no backfill)."""
     cfg = copy.deepcopy(base)
     if int(spacing) <= 0:
         raise ValueError(f"lesion spacing must be positive, got {spacing}")
@@ -273,9 +220,8 @@ def build_grid_config(
     # --- lesion grid point ------------------------------------------------
     tk["lesion_spacing"] = int(spacing)
     tk["lesion_block_prob"] = round(float(p), 4)
-    # Strict overrides (same kind of fixed change as bstr_mult): always set, never
-    # inherited from the baseline. lesion_defaults already resolves each to the
-    # CLI override, else the baseline config value, else the seconds-based default.
+    # Strict overrides: always set, never inherited. lesion_defaults already
+    # resolves each to the CLI override, else the config value, else the default.
     tk["lesion_type_a_prob"] = round(float(type_a_prob), 4)
     tk["lesion_type_b_enabled"] = bool(type_b_enabled)
     tk["lesion_prerecognition_ticks"] = int(lesion_defaults["prerecognition_ticks"])
@@ -287,7 +233,6 @@ def build_grid_config(
 
 
 def metric_means(rows: list[dict]) -> dict[str, float]:
-    """Chain-mean raw value per metric from analyze_run rows."""
     df = pd.DataFrame(rows)
     return df.groupby("metric")["raw_value"].mean().to_dict()
 
@@ -304,9 +249,9 @@ def analyze_h5(label: str, cfg_path: Path, h5_path: Path, topo: dict,
 # Lesion codes (must match plugins/lesions.py).
 _LES_TYPE_A, _LES_TYPE_B, _LES_STATE_PRE, _LES_STATE_REPAIR = 0, 1, 0, 1
 
-# Blocking regimes, as category codes painted onto the lattice each frame. These
-# are exactly the (type, state) rows of lesions.lesion_stalls_cohesin that stall
-# cohesin (B-PRE never blocks; A-PRE only blocks when RNAPII is absent).
+# Blocking-regime category codes: exactly the (type, state) rows of
+# lesions.lesion_stalls_cohesin that stall cohesin (B-PRE never blocks; A-PRE only
+# blocks when RNAPII is absent).
 _CAT_A_PRE, _CAT_A_REPAIR, _CAT_B_REPAIR = 1, 2, 3
 _CATEGORIES = {"a_pre": _CAT_A_PRE, "a_repair": _CAT_A_REPAIR, "b_repair": _CAT_B_REPAIR}
 
@@ -357,10 +302,9 @@ def _dwell_summary(run_ticks: list[int], tick_seconds: float, prefix: str,
 
 def _stage_frac(out: dict[str, float], tick_seconds: float,
                 prerecognition_ticks: float | None, repair_ticks: float | None) -> None:
-    """Add ``<cat>_stall_frac_of_stage`` to ``out``: the per-encounter mean stall
-    divided by the lesion's mean lifetime in that stage (PRE -> pre-recognition
-    window, REPAIR -> repair window). NaN when the window is unknown (the caller
-    did not pass it) or the category had no measured stall."""
+    """Add ``<cat>_stall_frac_of_stage`` to ``out``: per-encounter mean stall over
+    the lesion's mean lifetime in that stage (PRE -> pre-recognition window,
+    REPAIR -> repair window). NaN when the window is unknown or there was no stall."""
     stage_ticks = {"a_pre": prerecognition_ticks,
                    "a_repair": repair_ticks, "b_repair": repair_ticks}
     for cat in _CATEGORIES:
@@ -376,35 +320,27 @@ def measure_lesion_stall(
     *, prerecognition_ticks: float | None = None, repair_ticks: float | None = None,
     positions: np.ndarray | None = None,
 ) -> dict[str, float]:
-    """Measure lesion-induced cohesin stalling DIRECTLY from a 1D trajectory.
+    """Measure lesion-induced cohesin stalling directly from a 1D trajectory.
 
-    A cohesin leg is counted as lesion-stalled in a frame when the site it would
-    extrude into holds a *blocking* lesion: the left leg (``positions[:,j,0]``)
-    steps to ``pos-1``, the right leg (``positions[:,j,1]``) to ``pos+1`` (see
-    lef_dynamics; left.pos <= right.pos always, and slot ``j`` is a stable column
-    so a reload jump ends a run). A lesion blocks cohesin when it is in REPAIR
-    (either type) or PRE as Type A with RNAPII absent -- exactly
+    A leg is lesion-stalled in a frame when the site it would extrude into holds a
+    blocking lesion: the left leg (``positions[:,j,0]``) steps to ``pos-1``, the
+    right (``positions[:,j,1]``) to ``pos+1`` (left.pos <= right.pos always; slot
+    ``j`` is a stable column so a reload jump ends a run). A lesion blocks cohesin
+    when in REPAIR (either type) or PRE as Type A with RNAPII absent -- exactly
     ``lesions.lesion_stalls_cohesin``.
 
-    Two complementary readouts, neither using an analytic stall formula:
+    Two readouts, neither using an analytic formula: time-averaged occupancy
+    (``stalled_per_lesion`` etc.), and dwell DURATION -- a stall event is a maximal
+    run of consecutive blocked frames for one ``(slot, leg)``, length x
+    ``tick_seconds``. Runs touching frame 0 (left-censored) or open at the final
+    frame (right-censored) are dropped. Each frame is one tick, so this needs FULL
+    frames (no striding); frames stream in blocks of ``chunk`` to bound memory.
 
-    * Occupancy (time-averaged): ``stalled_per_lesion`` etc. -- how busy lesions
-      are (folds in dwell + arrival rate).
-    * Dwell DURATION in seconds: a stall event is a maximal run of consecutive
-      blocked frames for one ``(slot, leg)``; its length x ``tick_seconds`` is the
-      realized stall. Runs touching frame 0 (left-censored) or still open at the
-      final frame (right-censored) are dropped. Each recorded frame is one tick,
-      so this requires FULL frames (no striding); frames are streamed in blocks of
-      ``chunk`` to bound memory.
-
-    Returns occupancy keys plus the OVERALL stall duration (``dwell_mean_s`` /
-    ``dwell_median_s`` / ``dwell_p90_s`` / ``dwell_max_s`` / ``n_stall_events`` /
-    ``stalled_legtick_fraction``) AND a per-regime breakdown for each blocking
-    category -- ``a_pre`` (Type A pre-recognition), ``a_repair`` (Type A repair),
-    ``b_repair`` (Type B repair) -- with the same ``<cat>_dwell_*`` / ``_n_events``
-    / ``_legtick_fraction`` keys. The overall run is the full continuous stall;
-    the per-category segments split it where the blocking lesion changes
-    (type, state), e.g. a Type A lesion's PRE phase vs its REPAIR phase.
+    Returns occupancy keys, the OVERALL stall duration (``dwell_*`` /
+    ``n_stall_events`` / ``stalled_legtick_fraction``), and a per-regime breakdown
+    (``a_pre`` / ``a_repair`` / ``b_repair`` with ``<cat>_dwell_*`` / ``_n_events``
+    / ``_legtick_fraction``). The overall run is the full continuous stall; the
+    per-category segments split it where the blocking lesion's (type, state) changes.
     """
     keys = ("stalled_legs_per_frame", "lesions_per_frame", "blocking_lesions_per_frame",
             "stalled_per_lesion", "stalled_per_blocking_lesion",
@@ -420,10 +356,8 @@ def measure_lesion_stall(
                 base.update(_dwell_summary([], tick_seconds, cat, 0, 1, 1))
             _stage_frac(base, tick_seconds, prerecognition_ticks, repair_ticks)
             return base
-        # ``positions`` may be supplied by a caller that already loaded the dataset
-        # (the grid ``record`` step shares one decompress with analyze_h5); then we
-        # slice that in-memory array instead of re-reading positions from disk. The
-        # values are the same bytes, so every stall count/dwell is identical.
+        # ``positions`` may be supplied by a caller that already loaded the dataset,
+        # sharing one decompress; same bytes -> every stall count/dwell is identical.
         frames = int(positions.shape[0]) if positions is not None else int(h["positions"].shape[0])
         n_lefs = int(positions.shape[1]) if positions is not None else int(h["positions"].shape[1])
         ds_sites, ds_states, ds_types = h["lesions"], h["lesion_states"], h["lesion_types"]
@@ -443,10 +377,8 @@ def measure_lesion_stall(
 
         stalled = lesions_tot = blocking_tot = 0
         # Overall continuous stall (any blocking lesion). Completed run lengths are
-        # collected as per-frame int arrays and concatenated once at the end, rather
-        # than appended element-by-element via ``int(x)`` -- same values in the same
-        # order (so every dwell statistic is byte-identical), without the per-event
-        # Python conversion that scales with frames x lesion density.
+        # collected as per-frame arrays and concatenated once at the end (same values
+        # in the same order, so every dwell statistic is byte-identical).
         runs: list[np.ndarray] = []
         cur = np.zeros((n_lefs, 2), dtype=np.int64)
         from_zero = np.zeros((n_lefs, 2), dtype=bool)
@@ -458,9 +390,8 @@ def measure_lesion_stall(
         from_zero_cat = np.zeros((n_lefs, 2), dtype=bool)
         gf = 0
         # Category lookup indexed by ``type*2 + state``: 0=(A,PRE) 1=(A,REPAIR)
-        # 2=(B,PRE) 3=(B,REPAIR). A-PRE blocks cohesin only when RNAPII is absent;
-        # B-PRE never blocks (matches lesions.lesion_stalls_cohesin). Precomputing
-        # this lets the whole read-block be categorised with one table lookup.
+        # 2=(B,PRE) 3=(B,REPAIR). A-PRE blocks only when RNAPII is absent; B-PRE
+        # never blocks (matches lesions.lesion_stalls_cohesin).
         cat_lut = np.array(
             [_CAT_A_PRE if not rnapii else 0, _CAT_A_REPAIR, 0, _CAT_B_REPAIR],
             dtype=np.int8,
@@ -472,14 +403,11 @@ def measure_lesion_stall(
             types = ds_types[start:end]
             pos = positions[start:end] if positions is not None else ds_pos[start:end]
 
-            # Blocking category per recorded lesion, computed for the WHOLE block at
-            # once instead of rebuilt inside the per-frame loop: a table lookup on
-            # (type*2 + state), with the -1 padding / out-of-range sites cleared.
-            # Byte-identical to the former per-frame boolean masks (same category
-            # codes), but it removes ~6 numpy calls + three pad-copies per frame.
-            # Recorded lesions are site-sorted with the live entries packed into the
-            # low columns and -1 padding in the tail, so the valid set of each frame
-            # is its leading ``row_nv[k]`` columns (sliced below, no per-frame mask).
+            # Blocking category per recorded lesion via a table lookup on
+            # (type*2 + state), with -1 padding / out-of-range sites cleared.
+            # Recorded lesions are site-sorted with live entries packed into the low
+            # columns and -1 padding in the tail, so a frame's valid set is its
+            # leading ``row_nv[k]`` columns (sliced below, no per-frame mask).
             valid_blk = (sites >= 0) & (sites < N)
             code = types.astype(np.int16)
             code *= 2
@@ -579,10 +507,9 @@ def grid_label(p: float, spacing: int) -> str:
 
 
 def _run_grid_point(task: dict) -> dict:
-    """Worker: run (or reuse) the 1D LEF stage for one grid point and return its
-    H5 path. Top-level + picklable so it can be dispatched to a process pool.
-    Each process re-seeds numpy from the config seed inside ``lef.run``, so
-    results are deterministic and isolated from sibling workers."""
+    """Worker: run (or reuse) the 1D LEF stage for one grid point, returning its H5
+    path. Top-level + picklable for the process pool; each process re-seeds numpy
+    from the config seed, so results are deterministic and worker-independent."""
     h5_path = _resolve_h5(
         cfg_path=Path(task["cfg_path"]),
         requested_h5=None,
@@ -595,12 +522,10 @@ def _run_grid_point(task: dict) -> dict:
 
 def _measure_grid_point(task: dict, h5_path: Path) -> dict:
     """Compute one grid point's fold means + (optionally) the measured lesion-stall
-    dict from its trajectory. Split out from :func:`run_and_measure_grid_point` so
-    the per-point analysis is single-sourced. ``task`` carries the analysis inputs
-    (``topo`` and, when ``measure`` is set, ``tick_seconds`` / ``measure_chunk`` /
-    ``prerec_ticks`` / ``repair_ticks``). Returns raw per-point results; the parent
-    accumulates them into the grids (order-independent via ``ri``/``ci``), so the
-    output is byte-identical to computing them inline."""
+    dict from its trajectory. ``task`` carries the analysis inputs (``topo`` and,
+    when ``measure`` is set, ``tick_seconds`` / ``measure_chunk`` / ``prerec_ticks``
+    / ``repair_ticks``). The parent accumulates results order-independently via
+    ``ri``/``ci``, so output is byte-identical to computing them inline."""
     means = analyze_h5(task["label"], Path(task["cfg_path"]), Path(h5_path), task["topo"])
     ms = None
     if task.get("measure"):
@@ -612,10 +537,9 @@ def _measure_grid_point(task: dict, h5_path: Path) -> dict:
 
 
 def run_and_measure_grid_point(task: dict) -> dict:
-    """Worker: run/reuse one grid point's 1D H5 AND compute its analysis in the
-    same process, so the (previously serial) measurement parallelises with the 1D
-    stage across the pool. Top-level + picklable. Deterministic and independent per
-    point -> byte-identical to the sequential run-then-measure path."""
+    """Worker: run/reuse one grid point's 1D H5 AND analyse it in the same process,
+    so the measurement parallelises with the 1D stage. Top-level + picklable;
+    deterministic and per-point independent -> byte-identical to the serial path."""
     res = _run_grid_point(task)
     return _measure_grid_point(task, Path(res["h5"]))
 
@@ -641,20 +565,13 @@ def plot_heatmaps(
     y_ticklabels: list[str] | None = None,
 ) -> None:
     """Grid of heatmaps, one per metric in ``grids``. Rows = ``y_values``
-    (ascending), cols = density (lesions/Mbp, ascending).
+    (ascending), cols = density (ascending).
 
-    ``center`` selects the colour scale: a float centres a diverging map there
-    (e.g. fold = 1.0); ``None`` uses a plain sequential scale spanning the data
-    (for standalone measured quantities that have no natural midpoint). With
-    ``center=None`` and ``log_norm=True`` the colour scale (and colorbar ticks) is
-    logarithmic over the positive data -- the in-cell annotations are unaffected,
-    still showing the raw values.
-
-    ``cell_text`` overrides only the in-cell annotation text: a callable mapping a
-    finite cell value to its display string (non-finite cells still show "n/a").
-    The colour scale is unaffected, so two heatmaps of the same grid differing only
-    in ``cell_text`` look identical apart from the printed numbers. When ``None``
-    the text is ``cell_fmt.format(value)``."""
+    ``center``: a float centres a diverging map there (e.g. fold = 1.0); ``None``
+    uses a sequential scale spanning the data, and with ``log_norm=True`` a log
+    scale over positive data (cell annotations always show raw values). ``cell_text``
+    overrides only the in-cell text (callable on finite values; else
+    ``cell_fmt.format(value)``); the colour scale is unaffected."""
     metrics = [m for m in labels if m in grids]
     ncols = min(3, max(1, len(metrics)))
     nrows = int(np.ceil(len(metrics) / ncols))
@@ -673,8 +590,6 @@ def plot_heatmaps(
             vmin, vmax = min(dmin, center - 1e-6), max(dmax, center + 1e-6)
             norm = TwoSlopeNorm(vcenter=center, vmin=vmin, vmax=vmax)
         elif log_norm:
-            # Logarithmic colour scale (positive data only); cell annotations are
-            # unaffected -- they print the raw values, not the log-mapped colour.
             pos = finite[finite > 0]
             lo = float(pos.min()) if pos.size else 1e-6
             norm = LogNorm(vmin=lo, vmax=dmax if dmax > lo else lo * 10.0)
@@ -711,8 +626,8 @@ def plot_heatmaps(
 
     fig.suptitle(title, fontsize=13, y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    fig.savefig(out_path)  # format inferred from the file suffix
-    fig.savefig(out_path.with_suffix(".png"))  # format inferred from the file suffix
+    fig.savefig(out_path)
+    fig.savefig(out_path.with_suffix(".png"))
     plt.close(fig)
 
 
@@ -874,9 +789,8 @@ def main() -> None:
         "tad_size_exponent": tk.get("lesion_tad_size_exponent", DEFAULT_TAD_SIZE_EXPONENT),
         "tad_repair_exponent": tk.get("lesion_tad_repair_exponent", DEFAULT_TAD_REPAIR_EXPONENT),
     }
-    # Strict CLI overrides (control these like --type-a-prob): given in SECONDS,
-    # converted to ticks (round(seconds / tick_seconds), floored at 1), they replace
-    # the inherited value uniformly across every grid config.
+    # Strict CLI overrides given in SECONDS, converted to ticks (floored at 1) and
+    # applied uniformly across every grid config.
     if args.repair_seconds is not None:
         lesion_defaults["repair_ticks"] = max(1, int(round(args.repair_seconds / tick_seconds)))
     if args.prerecognition_seconds is not None:
@@ -891,10 +805,9 @@ def main() -> None:
     p_sorted = sorted(p_values)  # ascending p -> ascending stall (0.8..1.0)
     sp_sorted = sorted(spacings, reverse=True)  # 200..10 -> ascending density
 
-    # Effective cohesin stall (s): the realized hold time at a lesion, bounded by
-    # lesion repair (the lesion is removed) and -- unless --no-lifetime-cap -- the
-    # cohesin stalled lifetime. repair_ticks is the same across the grid (it is
-    # not a swept variable); lifetime_stalled is read from the config.
+    # Effective cohesin stall (s): bounded by lesion repair and -- unless
+    # --no-lifetime-cap -- the cohesin stalled lifetime. repair_ticks is uniform
+    # across the grid (not swept); lifetime_stalled is read from the config.
     repair_ticks = float(lesion_defaults["repair_ticks"])
     lifetime_stalled = float(lef.get("lifetime_stalled") or lef.get("lifetime") or 0) or None
     life_term = None if args.no_lifetime_cap else lifetime_stalled
@@ -992,8 +905,7 @@ def main() -> None:
     measured = {k: np.full(shape, np.nan) for k in measured_keys}
 
     # Each task carries the per-point analysis inputs (topo + measurement knobs) so
-    # the worker can run the 1D stage AND measure in the same process; the parent
-    # only accumulates the returned dicts.
+    # the worker can run the 1D stage and measure in one process.
     tasks = [
         {
             "ri": ri, "ci": ci, "p": p, "sp": sp,
@@ -1036,12 +948,10 @@ def main() -> None:
                   f"(p={task['p']:.3f}, density={density_axis[task['ci']]:.1f}/Mbp)")
             _accumulate(run_and_measure_grid_point(task))
     else:
-        # Process pool: each grid point is an independent process that re-seeds
-        # numpy from the config, writes its own H5, AND measures it -> results are
-        # bitwise-identical to sequential, just concurrent (1D stage + the formerly
-        # serial analysis now both parallelise). A fork context avoids re-importing
-        # this module (and matplotlib) in every worker. ``ex.map`` preserves order,
-        # so zipping with ``tasks`` recovers each point's axis values for logging.
+        # Process pool: each grid point re-seeds numpy from the config and writes
+        # its own H5 -> results are bitwise-identical to sequential. A fork context
+        # avoids re-importing this module (and matplotlib) in every worker.
+        # ``ex.map`` preserves order, so zipping with ``tasks`` recovers axis values.
         print(f"running {total} grid points with --jobs {jobs} (process pool, fork context)")
         ctx = mp.get_context("fork")
         with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
@@ -1057,8 +967,8 @@ def main() -> None:
     svg_path = plots_dir / "lesion_grid_heatmaps.svg"
     tsv_path = plots_dir / "lesion_grid_folds.tsv"
     y_label = "Lesion block probability p (per tick)"
-    # Fold heatmaps: y-axis is now the raw swept knob (lesion_block_prob), not a
-    # derived seconds value; colour bar still centred at fold = 1.0.
+    # Fold heatmaps: y-axis is the raw swept knob (lesion_block_prob); colour bar
+    # centred at fold = 1.0.
     plot_heatmaps(
         folds, METRIC_LABELS,
         y_values=p_sorted, y_label=y_label, density_axis=density_axis, x_label=x_label,

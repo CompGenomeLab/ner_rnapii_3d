@@ -1,33 +1,19 @@
 #!/usr/bin/env python
 """Grid search over Type A fraction x lesion density at a FIXED cohesin block prob.
 
-Sister script to ``gen_lesion_grid_and_heatmaps.py``. There the swept knob is
-``lesion_block_prob`` (cohesin stall strength); here that is held STATIC
-(``--block-prob``) and the two grid axes are instead:
+Sister script to ``gen_lesion_grid_and_heatmaps.py`` (which sweeps
+``lesion_block_prob``); here that is held STATIC (``--block-prob``) and the grid
+axes are instead:
 
   Y -- ``lesion_type_a_prob``: P(a gene-body lesion is Type A / TC-NER). Type A
-       lesions block cohesin already during pre-recognition (a long ~1200 s
-       window, with RNAPII off the lesion does the stalling intrinsically); Type
-       B only blocks once in the REPAIR state. Sweeping this dials the lesion
-       population from all-GG-NER (B) to all-TC-NER (A). Off-gene lesions are
-       always Type B regardless.
-  X -- lesion DENSITY in lesions/Mbp, set via ``lesion_spacing`` in SITES
-       (density = 1e6/(spacing*bp_per_site)), exactly as in the sister script.
+       lesions block cohesin already during pre-recognition; Type B only blocks
+       once in the REPAIR state. Off-gene lesions are always Type B.
+  X -- lesion DENSITY in lesions/Mbp (density = 1e6/(spacing*bp_per_site)).
 
-Every config otherwise matches the sister script's transform: RNAPII fully off
-(``max_rnapii: 0``, ``rnapii_load``/``rnapii_translocate`` nulled), boundary
-strengths x ``--bstr-mult`` capped at 1.0, and the lesion plugin enabled. For
-each grid point the 1D LEF stage is run (or a matching H5 reused), and the same
-outputs are produced with the y-axis relabelled to Type A probability:
-
-  * ``ta_density_heatmaps``               -- per metric, grid mean / BASELINE mean.
-  * ``ta_density_measured_stall``         -- per-lesion stall occupancy (measured).
-  * ``ta_density_measured_stall_seconds`` -- overall stall duration mean+median (s).
-  * ``ta_density_measured_stall_by_type`` -- A-PRE / A-repair / B-repair mean (s),
-    the regime that this sweep is built to move.
-
-All measurement / plotting / config-building is imported from the sister module;
-this file only swaps which variable is swept.
+Outputs (y-axis relabelled to Type A probability): fold heatmaps vs baseline,
+measured per-lesion stall occupancy, stall duration (s), and stall by lesion
+type/state. Measurement / plotting / config-building are imported from the
+sister module; this file only swaps which variable is swept.
 """
 from __future__ import annotations
 
@@ -86,11 +72,7 @@ from gen_lesion_grid_and_heatmaps import (
 
 
 def _run_measure_typea(task: dict) -> dict:
-    """Worker: run/reuse one grid point's 1D H5, compute its fold means + measured
-    lesion-stall dict (shared worker), then add the measured Type-A-per-kb-of-gene-
-    body burden. Top-level + picklable so the whole run+analyze step parallelises
-    across the pool; deterministic per point -> byte-identical to the sequential
-    path. ``task`` carries ``gb_mask`` / ``bp_per_site`` for the extra readout."""
+    """Worker: run/measure one grid point, then add the measured Type-A-per-kb-of-gene-body burden."""
     res = run_and_measure_grid_point(task)
     if task.get("measure"):
         res["typea"] = measure_typea_per_kb_genebody(
@@ -115,10 +97,7 @@ TYPEA_KB_PER_LESION_LABELS = {
 
 
 def gene_body_mask(base: dict) -> np.ndarray:
-    """Boolean lattice mask (length N) marking gene-body sites for the baseline
-    genes + TAD layout (replicated across chains when configured). Mirrors the mask
-    inside ``gene_body_mass``. ``mask.sum()`` is the total gene-body length in
-    SITES; multiply by bp_per_site/1000 for kb."""
+    """Boolean lattice mask (length N) marking gene-body sites; ``mask.sum()`` is the gene-body length in SITES."""
     lef = base["lef"]
     tk = lef.get("topology_kwargs", {})
     chain_length = int(lef["chain_length"])
@@ -140,16 +119,13 @@ def gene_body_mask(base: dict) -> np.ndarray:
 def measure_typea_per_kb_genebody(
     h5_path: Path, gb_mask: np.ndarray, *, bp_per_site: int = 1000, chunk: int = 2000
 ) -> float:
-    """Mean number of Type-A lesions present inside gene bodies, per kb of gene
-    body, measured DIRECTLY from the 1D trajectory (time-averaged over frames).
+    """Time-averaged Type-A lesions inside gene bodies per kb of gene body, measured from the 1D trajectory.
 
-    This is the *realised* Type-A burden a traversing cohesin sees -- it reflects
-    the lesion dynamics (placement, recognition, repair/removal) rather than the
-    analytic placement density ``P(A) x density``. Type-A lesions live only in gene
-    bodies, but we restrict to the gene-body mask explicitly and divide by the total
-    gene-body length in kb (sites * bp_per_site / 1000), so the result is normalised
-    per kb of gene body across lattice resolutions. Returns Type-A lesions / kb of
-    gene body (NaN if no gene bodies or the H5 has no lesion datasets)."""
+    This is the *realised* Type-A burden a traversing cohesin sees (reflecting
+    lesion dynamics), not the analytic placement density ``P(A) x density``.
+    Normalised per kb of gene body (sites * bp_per_site / 1000) so it is
+    comparable across lattice resolutions. NaN if no gene bodies or no lesion
+    datasets."""
     gb_sites = int(gb_mask.sum())
     gb_kb = gb_sites * bp_per_site / 1000.0
     if gb_sites <= 0:
@@ -172,11 +148,7 @@ def measure_typea_per_kb_genebody(
             end = min(start + chunk, frames)
             sites = ds_sites[start:end]
             types = ds_types[start:end]
-            # Vectorised over the whole read block (was a per-frame Python loop):
-            # mask every in-bounds Type-A lesion site, then count its gene-body hits
-            # in one fancy-index. ``total`` is a sum of integer counts, so collapsing
-            # the per-frame loop into one reduction is bit-identical -- the density
-            # value (and any downstream analysis) is unchanged, only ~4x faster.
+            # Mask every in-bounds Type-A lesion site, then count its gene-body hits.
             valid = (sites >= 0) & (sites < N) & (types == _LES_TYPE_A)
             ss = sites[valid]
             if ss.size:
@@ -274,8 +246,8 @@ def main() -> None:
         "tad_size_exponent": tk.get("lesion_tad_size_exponent", DEFAULT_TAD_SIZE_EXPONENT),
         "tad_repair_exponent": tk.get("lesion_tad_repair_exponent", DEFAULT_TAD_REPAIR_EXPONENT),
     }
-    # Recognition/repair may be given in SECONDS on the CLI; convert to ticks here
-    # (tick number = round(seconds / tick_seconds), floored at 1 tick).
+    # Recognition/repair may be given in SECONDS on the CLI; convert to ticks
+    # (= round(seconds / tick_seconds), floored at 1 tick).
     if args.prerecognition_seconds is not None:
         lesion_defaults["prerecognition_ticks"] = max(1, int(round(args.prerecognition_seconds / tick_seconds)))
     if args.repair_seconds is not None:
@@ -285,12 +257,10 @@ def main() -> None:
     # Axis orderings: ascending Type A (rows) and ascending density (cols).
     ta_sorted = sorted(_p_values(args.ta_hi, args.ta_lo, args.ta_step))
     sp_sorted = sorted(set(args.spacings), reverse=True)
-    # X-axis density: total (B on). With B off, P(A) is the y-axis here, so the
-    # per-column x-axis is the gene-body (Type-A-eligible) density (= Type-A density
-    # at P(A)=1); a cell's actual Type-A density is x_density x its row's P(A).
+    # With B off the per-column x-axis is the gene-body (Type-A-eligible) density
+    # (= Type-A density at P(A)=1); a cell's actual Type-A density is x x row P(A).
     type_b_enabled = bool(args.lesion_type_b_enabled)
     gbm = gene_body_mass(base, float(lesion_defaults["tad_size_exponent"])) if not type_b_enabled else 1.0
-    # Gene-body mask + length (kb) for the measured Type-A-per-kb-of-gene-body readout.
     gb_mask = gene_body_mask(base)
     gb_kb = gb_mask.sum() * bp_per_site / 1000.0   # gene-body length in kb (sites -> kb)
     density_axis = lesion_density_axis(
@@ -356,9 +326,8 @@ def main() -> None:
     measured = {k: np.full(shape, np.nan) for k in _measured_keys()}
     measured[TYPEA_PERKB_KEY] = np.full(shape, np.nan)
 
-    # Each task carries the per-point analysis inputs (topo + measurement knobs,
-    # plus the gene-body mask for the Type-A-per-kb readout) so the worker can run
-    # the 1D stage AND measure in one process; the parent only accumulates.
+    # Each task carries the per-point analysis inputs so the worker can run the 1D
+    # stage AND measure in one process; the parent only accumulates.
     tasks = [
         {
             "ri": ri, "ci": ci, "ta": ta, "sp": sp,
@@ -412,8 +381,6 @@ def main() -> None:
                 _accumulate(result)
 
     # 3) outputs ----------------------------------------------------------
-    # Y axis labels the row's Type A probability only; the measured per-row
-    # Type-A/kb burden has its own dedicated panel below.
     y_label = "Lesion Type A probability"
     y_fmt = "{:.2f}"
     y_ticklabels = None
@@ -462,10 +429,8 @@ def main() -> None:
             value_label="Type-A lesions / kb gene body", cell_fmt="{:.4f}", cell_fontsize=4.5,
             center=None, cmap=SEQ_CMAP,
         )
-        # Same readout expressed as a SPACING: kb of gene body per Type-A lesion =
-        # 1 / (Type-A per kb). Plotting the reciprocal grid makes the colour scale,
-        # colorbar ticks and integer cell annotations all consistent (kb, not /kb).
-        # Zero/non-finite density -> no finite spacing -> NaN cell ("n/a").
+        # Same readout as a SPACING: kb of gene body per Type-A lesion = 1 / (per kb).
+        # Zero/non-finite density -> no finite spacing -> NaN cell.
         ta_perkb_inv_svg = out_dir / "ta_density_typea_one_per_kb_genebody.svg"
         dens = measured[TYPEA_PERKB_KEY]
         with np.errstate(divide="ignore", invalid="ignore"):

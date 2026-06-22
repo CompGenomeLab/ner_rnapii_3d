@@ -1,26 +1,18 @@
 #!/usr/bin/env python
-"""Compare two 1D LEF runs per replicate chain and plot normalized folds.
+"""Compare two 1D LEF runs per replicate chain and plot config2/config1 folds.
 
-The first config/H5 is the baseline. For each metric, every replicate-chain
-value is normalized by the mean of baseline replicate chains. The script writes
-one SVG with separate metric panels plus TSV summaries.
+The first config/H5 is the baseline; each replicate-chain value is normalized by
+the mean of baseline replicate chains. Writes one SVG of metric panels plus TSV
+summaries. If an H5 path is omitted, runs/reuses OUT_DIR/LABEL/LEFPositions.h5.
 
-Example
--------
     uv run python scripts/compare_config_chain_metrics.py \
       --config1 configs_test/config1_5k.yaml \
       --config2 configs_test/config2_5k.yaml \
       --out-dir dummy/1d_5k/config2_vs_config1_chain_metrics
 
-If an H5 path is omitted, the script runs/reuses the 1D LEF stage at
-``OUT_DIR/LABEL/LEFPositions.h5``.
-
-Statistics
-----------
-For each metric the script tests config1 chains against config2 chains with a
-two-sided two-sample permutation test on raw per-chain values. It is exact through
-200,000 partitions and otherwise uses 200,000 deterministic Monte Carlo samples.
-This treats replicate chains as independent samples and does not assume normality.
+Per-metric significance is a two-sided two-sample permutation test on raw
+per-chain values (exact through 200,000 partitions; otherwise 200,000
+deterministic Monte Carlo samples).
 """
 from __future__ import annotations
 
@@ -82,12 +74,7 @@ def _safe_mean(values: np.ndarray) -> float:
 
 
 def _hist_percentile(hist: np.ndarray, percentile: float) -> float:
-    """Linear percentile of an integer-valued sample represented by a histogram.
-
-    This is NumPy's default ``method="linear"`` calculation without expanding
-    every loop span into a trajectory-sized array. The interpolation branch is
-    intentionally the same as NumPy's private ``_lerp`` implementation.
-    """
+    """Linear percentile (NumPy ``method="linear"``) of a histogram-encoded sample, without materialising the sample."""
     n = int(hist.sum())
     if n == 0:
         return float("nan")
@@ -116,9 +103,9 @@ def _safe_label(label: str) -> str:
 def _tad_intervals(kwargs: dict, chain: int) -> list[tuple[int, int]]:
     """Per-TAD ``(left, right)`` inclusive anchor sites from either schema.
 
-    The new ``tads`` schema lists each TAD's anchors directly; the legacy
-    ``tad_positions`` form tiles the chain into intervals ``[start, end)`` whose
-    convergent anchors sit at ``start`` (left) and ``end - 1`` (right).
+    The ``tads`` schema lists anchors directly; the legacy ``tad_positions``
+    form tiles the chain into ``[start, end)`` intervals whose convergent
+    anchors sit at ``start`` (left) and ``end - 1`` (right).
     """
     tads = kwargs.get("tads")
     if tads:
@@ -157,12 +144,11 @@ def _topology(cfg: dict) -> dict:
         hi = max(0, min(chain - 1, hi))
         gene_mask[lo : hi + 1] = True
 
-    # Oriented inward-facing anchors per TAD: the left-facing anchor (captures the
-    # leftward -1 leg) sits at ``left``; the right-facing anchor (captures the
-    # rightward +1 leg) at ``right``. Chromosome-end anchors (site 0 / chain-1)
-    # are excluded so the COMBINED mask reproduces the legacy internal-anchor
-    # convention exactly (right anchor p-1 + left anchor p for each boundary p),
-    # and so the corner-dot metric counts only internal convergent pairs.
+    # Oriented inward-facing anchors per TAD: left-facing anchor at ``left``,
+    # right-facing at ``right``. Chromosome-end anchors (site 0 / chain-1) are
+    # excluded so the combined mask reproduces the legacy internal-anchor
+    # convention (right anchor p-1 + left anchor p for each boundary p), and so
+    # corner_dot counts only internal convergent pairs.
     left_ctcf_mask = np.zeros(chain, dtype=bool)
     right_ctcf_mask = np.zeros(chain, dtype=bool)
     corner_pairs: dict[int, tuple[int, int]] = {}
@@ -391,11 +377,7 @@ def analyze_run(
     positions: np.ndarray | None = None,
     chunk: int = 2000,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    """Analyze one trajectory in memory-bounded blocks.
-
-    ``positions`` optionally accepts an existing array for callers/tests that
-    already own one; otherwise the HDF5 dataset is streamed directly.
-    """
+    """Analyze one trajectory in memory-bounded blocks, streaming the HDF5 dataset unless ``positions`` is supplied."""
     del cfg_path
     chain = topo["chain"]
     num_chains = topo["num_chains"]
@@ -420,9 +402,8 @@ def analyze_run(
         source = h5["positions"]
         frames, lefs, _ = source.shape
 
-    # Bound derived-array memory when LEFs scale up; this target is a maximum
-    # number of loop rows, not a model-size assumption. Integer accumulators and
-    # explicit cross-block step handling make the result chunk-invariant.
+    # Bound derived-array memory as LEFs scale; integer accumulators and explicit
+    # cross-block step handling keep the result chunk-invariant.
     chunk = min(max(1, int(chunk)), max(1, 2_000_000 // max(lefs, 1)))
     counts = {
         name: np.zeros(num_chains, dtype=np.int64)
@@ -539,9 +520,7 @@ def analyze_run(
     for chain_idx in range(num_chains):
         hist = span_hist[chain_idx]
         n_spans = int(hist.sum())
-        # sum(span_value * count) over the histogram, vectorised (was a Python loop
-        # over all `chain` bins per chain). Both sides are int64, so the dot product
-        # is the same integer total -- byte-identical, without the per-bin overhead.
+        # sum(span_value * count) over the histogram; both sides int64.
         span_total = int(span_index @ hist)
         mean_span = span_total / n_spans if n_spans else float("nan")
 
@@ -814,9 +793,9 @@ def _draw_metric_panel(
 ) -> None:
     sub_metric = metrics[metrics["metric"] == metric]
     values = sub_metric["fold_vs_config1_mean"].to_numpy(dtype=float)
-    # Folds are NaN/Inf when the config1 baseline mean is 0 (e.g. a metric like
-    # corner_dot that never fires in a short run). Derive axis limits from finite
-    # values only and fall back to a default window so the panel still renders.
+    # Folds are NaN/Inf when the config1 baseline mean is 0 (e.g. corner_dot
+    # never firing in a short run); derive axis limits from finite values only,
+    # falling back to a default window so the panel still renders.
     finite = values[np.isfinite(values)]
     if finite.size:
         y_min = min(0.78, float(finite.min()) * 0.92)

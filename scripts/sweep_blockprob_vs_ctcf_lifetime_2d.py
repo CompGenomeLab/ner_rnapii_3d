@@ -1,40 +1,21 @@
 #!/usr/bin/env python
-"""2D RNAPII-cohesin block-probability x CTCF-lifetime sweep at the 1D LEF stage.
+"""2D RNAPII block-probability x CTCF-lifetime sweep at the 1D LEF stage; per-metric fold-change heatmaps vs config1.
 
-Companion to ``sweep_lifetime_cohesin_vs_ctcf_2d.py``. Instead of sweeping the
-cohesin lifetime, this script sweeps two axes and produces a 2D heatmap per
-metric:
+The y axis applies one absolute probability jointly to the three active RNAPII
+barriers (paused/elongating/terminating); the x axis scales ``lef.lifetime_ctcf``
+by a multiplier. RNAP is left on so the block-probability axis is meaningful.
 
-* **y axis - RNAPII-cohesin block probability (active trio).** A single absolute
-  probability is applied jointly to ``lef.topology_kwargs.rnapii_paused_block_prob``,
-  ``rnapii_elongating_block_prob`` and ``rnapii_terminating_block_prob`` (the
-  "strong" barriers, baseline 0.923 each). The pre-initiation barrier
-  (``rnapii_pre_initiation_block_prob``, baseline 0.513) is left fixed at its baseline
-  value. Each value is the probability that cohesin is blocked when it meets a
-  paused/elongating/terminating Pol II.
-* **x axis - ``lef.lifetime_ctcf``** (the WAPL-protected lifetime of cohesin
-  captured at a CTCF anchor), swept by its own multiplier.
-
-Each grid cell (block prob, CTCF-lifetime multiplier) gets its own derivative
-config, its 1D trajectory is run/reused, and metrics are reported as fold changes
-versus the baseline config1 replicate-chain mean.
-
-RNAP is **left on** (NOT forced off): the block-probability axis is only
-meaningful with RNAPII present.
-
-Note: the H5-staleness check inspects only topology fields (frames, LEFs, N,
+The H5-staleness check inspects only topology fields (frames, LEFs, N,
 chain_length, num_chains, separation) - NOT block probabilities or
-``lifetime_ctcf``. A fresh ``--out-dir`` is therefore correct (each cell's H5 is
-absent and gets run). If you reuse a populated out-dir after changing either
-axis, pass ``--force-1d`` to regenerate trajectories.
+``lifetime_ctcf``. A fresh ``--out-dir`` is therefore correct; if you reuse a
+populated out-dir after changing either axis, pass ``--force-1d``.
 """
 from __future__ import annotations
 
 import os
 
-# Pin BLAS/OpenMP to one thread BEFORE numpy is imported so that running many 1D
-# sims under --jobs does not oversubscribe cores (each grid point is numpy-light;
-# parallelism comes from running whole sims concurrently, not threaded BLAS).
+# Pin BLAS/OpenMP to one thread BEFORE numpy is imported so running many 1D sims
+# under --jobs does not oversubscribe cores (parallelism is whole-sim, not BLAS).
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
@@ -63,7 +44,7 @@ from compare_config_chain_metrics import (  # noqa: E402
     analyze_run,
 )
 
-# Reuse the boundary-strength companion's building blocks so the run/analyze/
+# Reuse the boundary-strength companion's building blocks so run/analyze/
 # summarize/colormap logic stays single-sourced.
 from sweep_rnapoff_boundary_strength_1d import (  # noqa: E402
     FOLD_CMAP,
@@ -84,28 +65,20 @@ from sweep_rnapoff_boundary_strength_1d import (  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-# The three "active"/strong RNAPII barrier states swept jointly on the y axis.
+# The three active/strong RNAPII barrier states swept jointly on the y axis.
 TRIO_KEYS = (
     "rnapii_paused_block_prob",
     "rnapii_elongating_block_prob",
     "rnapii_terminating_block_prob",
 )
 
-# Legacy fallback seconds per simulation step, used only to annotate the block-prob
-# axis with an effective RNAPII dwell time (see ``block_tick_labels``) when the
-# baseline config carries no lef.tick_seconds. The resolution-aware value comes from
-# the baseline config's tick_seconds (or --seconds-per-step if given).
+# Fallback seconds per step, used only to annotate the block-prob axis with an
+# effective RNAPII dwell time when the baseline config carries no lef.tick_seconds.
 SECONDS_PER_STEP = 8.0
 
 
 def block_prob_values(lo: float, hi: float, step: float) -> list[float]:
-    """Ascending block probabilities from ``lo`` to ``hi`` (inclusive) by ``step``.
-
-    Values are clamped to the closed range [0, 1] (0.0 = "cohesin never blocked",
-    1.0 = "always blocked"). Ascending order so that, with ``origin='lower'``
-    heatmaps, the block probability increases upward. The lo/hi/step convention
-    mirrors ``--p-lo/--p-hi/--p-step`` in ``gen_lesion_grid_and_heatmaps.py``.
-    """
+    """Ascending block probabilities from ``lo`` to ``hi`` (inclusive) by ``step``, clamped to [0, 1]."""
     if step <= 0:
         raise argparse.ArgumentTypeError("--block-prob-step must be positive")
     if not (0.0 <= lo <= hi <= 1.0):
@@ -123,19 +96,11 @@ def inject_baseline_prob(
     step: float,
     eps: float = 1e-9,
 ) -> tuple[list[float], str]:
-    """Guarantee the config1 baseline block prob appears exactly in the y axis.
+    """Guarantee the config1 baseline block prob appears exactly in the y axis so one row reproduces config1.
 
-    So that one row reproduces config1 (the fold≈1.0 sanity cell when combined
-    with the 1x lifetime_ctcf column):
-
-    * If a generated value already equals the baseline, nothing changes.
-    * Else if the nearest generated value is within ``step/2`` of the baseline and
-      is an interior point (not the lo/hi endpoint), it is *snapped* to the exact
-      baseline (e.g. a swept 0.925 becomes the config's 0.923) - avoiding a
-      near-duplicate row and preserving the requested endpoints.
-    * Else the baseline is *inserted* as an extra row.
-
-    Returns the adjusted, de-duplicated, ascending list and a short note for logs.
+    A near grid value within ``step/2`` of the baseline (and not an endpoint) is
+    snapped to the exact baseline; otherwise the baseline is inserted as an extra
+    row. Returns the adjusted, de-duplicated, ascending list and a log note.
     """
     if baseline is None:
         return probs, "no baseline block prob resolved; left unchanged"
@@ -156,8 +121,8 @@ def inject_baseline_prob(
         values.append(baseline)
         note = note or f"inserted baseline {baseline:g}"
 
-    # De-dup/sort, but keep the baseline value byte-for-byte (un-rounded) so the
-    # cell uses exactly the parameter from config1.
+    # De-dup/sort, but keep the baseline value un-rounded so the cell uses
+    # exactly the parameter from config1.
     kept: list[float] = []
     for v in sorted(values):
         v = baseline if abs(v - baseline) <= eps else round(min(1.0, max(0.0, v)), 6)
@@ -167,11 +132,7 @@ def inject_baseline_prob(
 
 
 def prob_label(prob: float) -> str:
-    """Filesystem/display-safe label for an absolute probability.
-
-    Mirrors ``multiplier_label`` styling: ``1.0 -> "1"``, ``0.0 -> "0"``,
-    ``0.5 -> "0p5"``, ``0.923 -> "0p923"`` (dots replaced with ``p``).
-    """
+    """Filesystem/display-safe label for an absolute probability (dots replaced with ``p``)."""
     if float(prob).is_integer():
         return str(int(prob))
     return f"{prob:g}".replace(".", "p")
@@ -182,7 +143,7 @@ def _resolve_block_prob(kwargs: dict, key: str) -> float:
 
     paused/elongating fall back to ``rnapii_block_prob`` (default 1.0);
     terminating falls back to the resolved paused value. Used only for
-    ``method.json`` provenance - the sweep itself sets the three keys explicitly.
+    ``method.json`` provenance - the sweep sets the three keys explicitly.
     """
     generic = float(kwargs.get("rnapii_block_prob", 1.0))
     if key == "rnapii_terminating_block_prob":
@@ -212,12 +173,10 @@ def make_grid_config(
     block_prob: float,
     ctcf_mult: float,
 ) -> tuple[dict, dict]:
-    """Build one grid-cell config.
+    """Build one grid-cell config: ``block_prob`` set on the three active RNAPII barriers, ``ctcf_mult`` scaling lifetime_ctcf.
 
-    ``block_prob`` is assigned (as an absolute probability) to the three active
-    RNAPII barrier states together; ``ctcf_mult`` scales the CTCF-capture
-    lifetime. The pre-initiation block prob, the cohesin lifetimes and all RNAP settings
-    are left exactly as in the baseline config.
+    Pre-initiation block prob, cohesin lifetimes and all RNAP settings are left
+    exactly as in the baseline config.
     """
     cfg = copy.deepcopy(base_cfg)
     lef = cfg["lef"]
@@ -248,12 +207,9 @@ def cell_label(block_prob: float, ctcf_mult: float) -> str:
 def block_dwell_seconds(prob: float, seconds_per_step: float) -> float:
     """Effective RNAPII dwell time implied by a per-step block probability.
 
-    At a barrier the cohesin is blocked with probability ``p`` each step and
-    passes with probability ``1 - p``, so the mean number of blocked steps before
-    it passes is the geometric mean ``p / (1 - p)``. Multiplying by the wall-clock
-    seconds per step gives an effective dwell time (e.g. p=0.923 at 2 s/step ->
-    ~24 s; at the legacy 8 s/step -> ~96 s). ``p = 1`` (always blocked) is an
-    infinite dwell.
+    Each step cohesin is blocked with probability ``p`` and passes with ``1 - p``,
+    so the mean blocked steps before passing is ``p / (1 - p)``; times seconds per
+    step gives the dwell. ``p = 1`` (always blocked) is an infinite dwell.
     """
     if prob >= 1.0:
         return float("inf")
@@ -261,11 +217,7 @@ def block_dwell_seconds(prob: float, seconds_per_step: float) -> float:
 
 
 def block_tick_labels(probs: list[float], seconds_per_step: float = SECONDS_PER_STEP) -> list[str]:
-    """y-axis tick = absolute block probability plus its effective dwell (seconds).
-
-    Second line is the RNAPII dwell time ``p/(1-p) * seconds_per_step`` (``inf``
-    shown as ``∞``) so the probability is readable as a residence time.
-    """
+    """y-axis tick = block probability plus its effective dwell (seconds), ``inf`` shown as ``∞``."""
     labels = []
     for p in probs:
         dwell = block_dwell_seconds(p, seconds_per_step)
@@ -289,11 +241,10 @@ def plot_grid_heatmaps(
     spread_col: str = "fold_vs_config1_sd",
     title: str = "RNAPII block-prob x CTCF-lifetime sweep: fold change vs config1",
 ) -> None:
-    """One 2D heatmap per metric. x = lifetime_ctcf, y = RNAPII block prob.
+    """One 2D heatmap per metric (x = lifetime_ctcf, y = RNAPII block prob).
 
     ``cell_grid[i][j]`` is the config label for block-prob row ``i`` and
-    CTCF-lifetime column ``j``. Rows are drawn with ``origin='lower'`` so the
-    block probability increases upward.
+    CTCF-lifetime column ``j``; drawn ``origin='lower'`` so block prob increases upward.
     """
     n_block = len(cell_grid)
     n_ctcf = len(cell_grid[0]) if n_block else 0
@@ -437,8 +388,7 @@ def main() -> None:
     base_ctcf = _base_ctcf_lifetime(base_cfg)
     base_blocks = _base_block_probs(base_cfg)
     validate_baseline_h5(args.config1, args.h5_config1, args.label1)
-    # Resolution-aware seconds/step: prefer the CLI value, else the baseline config's
-    # tick_seconds, else the legacy 8 s fallback (annotation only).
+    # seconds/step: prefer the CLI value, else baseline tick_seconds, else fallback (annotation only).
     if args.seconds_per_step is None:
         args.seconds_per_step = float(base_cfg["lef"].get("tick_seconds") or SECONDS_PER_STEP)
 
@@ -460,8 +410,7 @@ def main() -> None:
     baseline_rows = selected_metric_rows(baseline_core, baseline_boundary)
 
     block_probs = block_prob_values(args.block_prob_lo, args.block_prob_hi, args.block_prob_step)
-    # Always include the config1 baseline block prob exactly (snap a near grid
-    # value to it, else insert it) so one row reproduces config1.
+    # Always include the config1 baseline block prob exactly so one row reproduces config1.
     baseline_block = base_blocks["rnapii_paused_block_prob"]
     if len({round(v, 9) for v in base_blocks.values()}) > 1:
         print(
@@ -554,7 +503,7 @@ def main() -> None:
     per_chain = pd.concat(all_metric_rows, ignore_index=True)
     summary, stats = summarize_sweep(per_chain, args.label1, grid_labels, jobs=jobs)
 
-    # Attach the two axis values to the per-cell summary/stats for clarity.
+    # Attach the two axis values to the per-cell summary/stats.
     for frame in (summary, stats):
         frame["rnapii_block_prob"] = frame["config"].map(
             lambda c: cell_meta.get(c, {}).get("rnapii_block_prob")

@@ -1,29 +1,10 @@
 #!/usr/bin/env python
-"""Grid search lesion TIMING (seconds) vs lesion density, at a fixed block prob.
+"""Grid search lesion TIMING (seconds) vs lesion density at a fixed block prob.
 
-Runs two independent sweeps, both against lesion density on the x-axis:
-
-  1. ``prerecog/`` -- pre-recognition time (y) x lesion density (x), with the
-     repair time held fixed. Pre-recognition is how long a lesion sits in the PRE
-     state before the repair machinery assembles. For Type A this is the window
-     during which the lesion intrinsically stalls cohesin (TC-NER / stalled-Pol-II
-     mimic, with RNAPII off); for Type B it sets when the lesion *starts* blocking
-     (B blocks only in REPAIR) and so the steady-state REPAIR fraction.
-  2. ``repair/`` -- repair time (y) x lesion density (x), with pre-recognition
-     held fixed. Repair time is how long a lesion stays in the (blocking) REPAIR
-     state before removal -- the dwell cap for both A and B repair stalls.
-
-Times are given in SECONDS and converted to ticks with the config's
-``tick_seconds`` (ticks = round(seconds / tick_seconds), >= 1). The y-axis shows
-the REALIZED seconds (ticks x tick_seconds) actually used by the simulation.
-
-Every config otherwise matches the sister scripts: RNAPII off, boundary strengths
-x ``--bstr-mult`` capped at 1.0, a STATIC ``--block-prob`` and ``--type-a-prob``.
-Each sweep writes the same family of outputs as the sister scripts (fold heatmaps
-+ measured occupancy / duration / by-type stall), with the y-axis relabelled to
-the swept time. The by-type figure is the headline: the pre-recognition sweep
-moves the Type A PRE stall; the repair sweep moves the A/B repair stalls.
-
+Runs two sweeps vs lesion density (x): ``prerecog/`` (pre-recognition time y,
+repair fixed) and ``repair/`` (repair time y, pre-recognition fixed). Times are
+given in SECONDS and converted to ticks via the config's ``tick_seconds``
+(ticks = round(seconds / tick_seconds), >= 1); the y-axis shows realized seconds.
 Building, measurement and plotting are imported from
 ``gen_lesion_grid_and_heatmaps.py``; this file only chooses what is swept.
 """
@@ -180,10 +161,9 @@ def run_sweep(
     folds = {m: np.full(shape, np.nan) for m in metrics_seen}
     measured = {k: np.full(shape, np.nan) for k in _measured_keys()}
 
-    # Per-row stage windows: the swept axis is this row's tick value, its fixed
-    # companion is the constant. Baked into each task as prerec_ticks/repair_ticks
-    # so the shared worker measures with the right windows and the parent only
-    # accumulates the returned dicts.
+    # Per-row stage windows (prerec_ticks, repair_ticks): the swept axis is this
+    # row's tick value, its fixed companion the constant; baked into each task so
+    # the shared worker measures with the right windows.
     def _windows(t: int) -> tuple[int, int]:
         return (t, fixed_ticks) if swept == "prerecog" else (fixed_ticks, t)
 

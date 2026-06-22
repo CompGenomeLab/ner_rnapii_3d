@@ -1,29 +1,20 @@
 #!/usr/bin/env python
 """2D cohesin-separation x CTCF-lifetime sweep at the 1D LEF stage.
 
-Companion to ``sweep_lifetime_cohesin_vs_ctcf_2d.py`` and
-``sweep_blockprob_vs_ctcf_lifetime_2d.py``. Both axes are multipliers and produce
-a 2D heatmap per metric:
+Both axes are multipliers and produce a 2D heatmap per metric:
 
-* **y axis - cohesin separation (density).** ``lef.separation`` is the average
-  number of lattice sites between LEFs; the number of cohesins is the derived
-  property ``num_lefs = num_sites // separation``. Scaling ``separation`` by a
-  multiplier therefore scales the cohesin *density* inversely (a larger
-  separation multiplier means fewer cohesins / lower density).
-* **x axis - ``lef.lifetime_ctcf``** (the WAPL-protected lifetime of cohesin
-  captured at a CTCF anchor), swept by its own multiplier.
+* y axis - cohesin separation (sites between LEFs); ``num_lefs = num_sites //
+  separation``, so a larger separation multiplier means fewer cohesins / lower
+  density.
+* x axis - ``lef.lifetime_ctcf``, the WAPL-protected lifetime of cohesin
+  captured at a CTCF anchor.
 
-Each grid cell (separation multiplier, CTCF-lifetime multiplier) gets its own
-derivative config, its 1D trajectory is run/reused, and metrics are reported as
-fold changes versus the baseline config1 replicate-chain mean.
+Each grid cell gets its own derivative config, its 1D trajectory is run/reused,
+and metrics are reported as fold changes versus the baseline config1 chain mean.
 
-RNAP is left exactly as configured in the baseline (not forced off).
-
-Note: ``separation`` *is* part of the H5-staleness check (unlike the lifetime /
-block-prob axes), so a changed separation is detected and reruns automatically.
-A fresh ``--out-dir`` is correct; reusing a populated out-dir is also safe here.
-``lifetime_ctcf`` is not in the staleness check, so if you reuse an out-dir after
-changing only that axis pass ``--force-1d``.
+``separation`` *is* part of the H5-staleness check (unlike the lifetime axis),
+so a changed separation reruns automatically. ``lifetime_ctcf`` is not, so if
+you reuse an out-dir after changing only that axis pass ``--force-1d``.
 """
 from __future__ import annotations
 
@@ -60,8 +51,6 @@ from compare_config_chain_metrics import (  # noqa: E402
     analyze_run,
 )
 
-# Reuse the boundary-strength companion's building blocks so the run/analyze/
-# summarize/colormap logic stays single-sourced.
 from sweep_rnapoff_boundary_strength_1d import (  # noqa: E402
     FOLD_CMAP,
     METRIC_LABELS,
@@ -107,12 +96,7 @@ def make_grid_config(
     sep_mult: float,
     ctcf_mult: float,
 ) -> tuple[dict, dict]:
-    """Build one grid-cell config.
-
-    ``sep_mult`` scales ``lef.separation`` (and hence inversely the cohesin
-    density, since ``num_lefs`` is derived); ``ctcf_mult`` scales the CTCF-capture
-    lifetime. All other settings (including RNAP) are left as in the baseline.
-    """
+    """Build one grid-cell config (sep_mult scales separation/inverse density; ctcf_mult scales CTCF-capture lifetime)."""
     cfg = copy.deepcopy(base_cfg)
     lef = cfg["lef"]
 
@@ -152,10 +136,8 @@ def plot_grid_heatmaps(
 ) -> None:
     """One 2D heatmap per metric. x = lifetime_ctcf, y = cohesin separation.
 
-    ``cell_grid[i][j]`` is the config label for separation row ``i`` and
-    CTCF-lifetime column ``j``. Rows are drawn with ``origin='lower'`` so the
-    separation multiplier increases upward (i.e. cohesin density decreases
-    upward).
+    Drawn with ``origin='lower'`` so the separation multiplier increases upward
+    (cohesin density decreases upward).
     """
     n_sep = len(cell_grid)
     n_ctcf = len(cell_grid[0]) if n_sep else 0
@@ -218,7 +200,7 @@ def plot_grid_heatmaps(
         cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
         cbar.ax.tick_params(labelsize=8, length=2)
 
-    # Hide any unused trailing axes (when len(metrics) is odd vs the 2-col grid).
+    # Hide any unused trailing axes when len(metrics) is odd vs the 2-col grid.
     for extra in range(len(metrics), nrows * ncols):
         r, c = divmod(extra, ncols)
         axes[r][c].set_visible(False)

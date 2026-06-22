@@ -1,24 +1,12 @@
 #!/usr/bin/env python
-"""2D cohesin-lifetime x CTCF-lifetime sweep at the 1D LEF stage.
+"""2D cohesin-lifetime x CTCF-lifetime sweep at the 1D LEF stage, producing a
+fold-change heatmap per metric vs the baseline config1.
 
-Companion to ``sweep_rnapoff_boundary_strength_1d.py``. Instead of sweeping CTCF
-boundary strength, this script sweeps two lifetime axes and produces a 2D
-heatmap per metric:
-
-* **y axis - cohesin lifetime.** A single multiplier is applied identically to
-  ``lef.lifetime``, ``lef.lifetime_stalled`` and
-  ``lef.topology_kwargs.lifetime_rnapii_stalled`` (the RNAPII-stalled cohesin
-  lifetime). These three move together as "the cohesin lifetime".
-* **x axis - ``lef.lifetime_ctcf``** (the WAPL-protected lifetime of cohesin
-  captured at a CTCF anchor), swept by its own multiplier.
-
-Each grid cell (cohesin-lifetime multiplier, CTCF-lifetime multiplier) gets its
-own derivative config, its 1D trajectory is run/reused, and metrics are reported
-as fold changes versus the baseline config1 replicate-chain mean.
-
-Unlike the boundary-strength companion, RNAP is **left as configured in the
-baseline** (not forced off) so that the ``lifetime_rnapii_stalled`` axis is
-biologically meaningful.
+The y axis multiplier scales the three cohesin-lifetime fields together
+(``lef.lifetime``, ``lef.lifetime_stalled`` and
+``lef.topology_kwargs.lifetime_rnapii_stalled``); the x axis multiplier scales
+``lef.lifetime_ctcf``. Unlike the boundary-strength companion, RNAP is left as
+configured in the baseline so the ``lifetime_rnapii_stalled`` axis is meaningful.
 
 Note: the H5-staleness check does not inspect lifetime fields, so if you change
 the baseline config's lifetimes and reuse an out-dir, pass ``--force-1d`` to
@@ -29,8 +17,8 @@ from __future__ import annotations
 import os
 
 # Pin BLAS/OpenMP to one thread BEFORE numpy is imported so that running many 1D
-# sims under --jobs does not oversubscribe cores (each grid point is numpy-light;
-# parallelism comes from running whole sims concurrently, not threaded BLAS).
+# sims under --jobs does not oversubscribe cores; parallelism comes from running
+# whole sims concurrently, not threaded BLAS.
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
@@ -59,7 +47,7 @@ from compare_config_chain_metrics import (  # noqa: E402
     analyze_run,
 )
 
-# Reuse the boundary-strength companion's building blocks so the run/analyze/
+# Reuse the boundary-strength companion's building blocks so run/analyze/
 # summarize/colormap logic stays single-sourced.
 from sweep_rnapoff_boundary_strength_1d import (  # noqa: E402
     FOLD_CMAP,
@@ -83,11 +71,10 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 def _base_lifetimes(base_cfg: dict) -> dict:
-    """Resolve the baseline values the two axes scale from.
+    """Resolve the baseline lifetimes the two axes scale from.
 
     ``lifetime_ctcf`` and ``lifetime_rnapii_stalled`` both fall back to the base
-    ``lifetime`` when unset (mirroring the config/topology defaults), so the
-    sweep multiplies an explicit, resolved baseline in every case.
+    ``lifetime`` when unset (mirroring the config/topology defaults).
     """
     lef = base_cfg["lef"]
     kwargs = lef.get("topology_kwargs", {}) or {}
@@ -111,12 +98,8 @@ def make_grid_config(
     life_mult: float,
     ctcf_mult: float,
 ) -> tuple[dict, dict]:
-    """Build one grid-cell config.
-
-    ``life_mult`` scales the three cohesin-lifetime fields together;
-    ``ctcf_mult`` scales the CTCF-capture lifetime. RNAP settings are left
-    exactly as in the baseline config.
-    """
+    """Build one grid-cell config: ``life_mult`` scales the three cohesin-lifetime
+    fields together; ``ctcf_mult`` scales the CTCF-capture lifetime."""
     cfg = copy.deepcopy(base_cfg)
     lef = cfg["lef"]
     kwargs = lef.setdefault("topology_kwargs", {})
@@ -247,7 +230,7 @@ def plot_grid_heatmaps(
         cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
         cbar.ax.tick_params(labelsize=8, length=2)
 
-    # Hide any unused trailing axes (when len(metrics) is odd vs the 2-col grid).
+    # Hide any unused trailing axes when len(metrics) is odd vs the 2-col grid.
     for extra in range(len(metrics), nrows * ncols):
         r, c = divmod(extra, ncols)
         axes[r][c].set_visible(False)
@@ -392,8 +375,8 @@ def main() -> None:
                 resolved_h5[res["label"]] = Path(res["h5"])
 
     # 3) analyze resolved H5s in deterministic grid order. ex.map preserves
-    # order, and each analysis is read-only, so parallel and sequential outputs
-    # are identical while large grids avoid a serial post-processing tail.
+    # order and each analysis is read-only, so parallel and sequential outputs
+    # are identical.
     analysis_tasks = [
         {"label": task["label"], "cfg_path": task["cfg_path"],
          "h5": str(resolved_h5[task["label"]]), "base_topology": base_topology}

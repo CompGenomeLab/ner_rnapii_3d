@@ -2,21 +2,23 @@
 """Generate human-calibrated config1-4 for the loop-extrusion + transcription
 pipeline at an arbitrary 1D tick size (1 site = BP_PER_SITE bp).
 
-Magnitudes are TICK-INDEPENDENT biology (rates /s, durations s, sizes kb);
-``--tick-seconds`` converts them to per-tick YAML probs via p = 1-exp(-k*t).
-Values are human (or closest mammalian) in-vivo, checked against the bands in
-gen_transcription_metrics.py HUMAN_RANGES. Key anchors:
+Parameters are authored as TICK-INDEPENDENT biology (rates /s, durations s,
+sizes kb); ``--tick-seconds`` converts them to per-tick YAML probabilities via
+p = 1-exp(-k*t). Values are human (or closest mammalian) in-vivo. Key anchors:
 
-  ELONGATION  ~2.1 kb/min median, per-gene 0.5-4 kb/min (Veloso 2014; Jonkers & Lis 2015).
-  PAUSING     single-Pol dwell ~42 s (Steurer 2018); ~75-80% premature termination
-              -> productive fraction ~0.15-0.25 (Gressel 2019; Zimmer STL-seq 2021).
-  INITIATION  productive ~1/min median (lincRNA 0.3, eRNA 0.15, up to ~87/min);
+  ELONGATION  ~2.1 kb/min model anchor; in-vivo median ~1.5 kb/min (Veloso 2014),
+              rising to 2-5 kb/min after ~15 kb (Jonkers & Lis 2015).
+  PAUSING     single-Pol dwell ~42 s (Steurer 2018); ~80% premature termination
+              -> productive fraction ~0.15-0.25 (Zimmer STL-seq 2021; Gressel 2019).
+  INITIATION  productive ~1/min median for mRNA, ~0.3 lincRNA, up to ~87/min (HSPA1A);
               realized rate is pause-escape-limited, not loading-limited (Gressel 2019).
-  3' DWELL    ~3 min over a ~3.3 kb termination zone (Schwalb 2016; Cortazar 2019).
-  TADs        classical scale (mean ~833 kb); convergent-CTCF + cohesin mechanism ~ Rao 2014.
+  3' DWELL    ~3 min over a ~3.3 kb termination window (Schwalb 2016; Cortazar 2019).
+  TADs        classical scale (mean ~833 kb); convergent-CTCF + cohesin mechanism (Rao 2014).
   CTCF        per-encounter stall ~0.125 (Gabriele 2022); config3 strengthens it x2.5.
-  COHESIN     1/240 kb, residence ~22.5 min, CTCF-stabilized x4 (Gabriele 2022; Hansen 2017).
-  CLASSES     ~20% housekeeping (Eisenberg & Levanon 2013); E-P median ~30 kb (Gasperini 2019).
+  COHESIN     1/240 kb; residence ~22.5 min (Hansen 2017 ~22; Gabriele 2022 ~20);
+              CTCF-stabilized x4 (Gabriele 2022, "stabilized fourfold").
+  CLASSES     ~3800 housekeeping genes, ~20% (Eisenberg & Levanon 2013);
+              E-P median ~24 kb (Gasperini 2019; drawn here at ~30 kb).
 
 config1 = txn ON; config2 = txn OFF (same skeleton/genes); config3 = config2 +
 stronger CTCF (x bstr-mult); config4 = config3 + UV lesions. Deterministic (seeded).
@@ -63,126 +65,93 @@ COHESIN_LIFETIME_SECONDS = 22.5 * 60
 CTCF_LIFETIME_BOOST = 4
 
 # ====================== RNAPII transcription kinetics ====================
-# Expressed-gene loading rate /s, geo-mean anchor (load_prob = 1-exp(-this*tick)); sets the overall
-# transcription LEVEL among EXPRESSED genes (force-silenced genes get a graded near-0 load, see SILENT_PROB /
-# LOAD_SILENT_BASAL_*). Output is loading-limited but bounded by two soft ceilings on the hottest genes:
-# gene-body density (<=~0.25 Pol/kb) and promoter pause-site clearance (~1/dwell). Real expression is Zipf
-# bottom-heavy. This is the level dial: 0.001 = healthy-tissue (detected median ~1/h, ~66% detected); 0.0013 =
-# a COMMON-GROUND level between healthy and cancer (detected median ~1.2-1.3/h, ~69% detected, more moderate/
-# active) -- more expressive than healthy without cancer-line hypertranscription. The active tail rides
-# LOAD_RATE_MAX + the short-dwell occlusion ceiling (rank-relative), so changing this geo-mean shifts the BULK
-# without flattening the tail. Raise toward 0.002+ for a fuller cancer line (detected median 1.5-1.8/h).
+# Expressed-gene loading rate /s (geometric-mean anchor; load_prob = 1-exp(-this*tick)). Sets the overall
+# transcription LEVEL among expressed genes (silenced genes get a graded near-0 load; see SILENT_PROB).
+# Output is bounded by two soft ceilings on the hottest genes: gene-body density (<=~0.25 Pol/kb) and
+# promoter pause-site clearance (~1/dwell). 0.0013 -> detected median ~1.2-1.3 transcripts/h, ~69% detected.
 RNAP_LOAD_RATE = 0.0013
 # Hard cap on a single gene's loading rate /s. With the pause-initiation limit enforced in the engine
 # (rnapii_promoter_occlusion; Gressel 2019, Bartman 2019), realized initiation is gated by pause-escape,
-# not this cap -- so it can stay open to let fast-pause (CDK9-like) genes reach the hot tail (up to HSPA1A
-# ~87/min) while slow-pause genes stay low. (At 250 bp/site re-initiation is clearance-bound ~5-9/min
-# regardless; pushing the cap too high jams the promoter under occlusion.)
+# not this cap, so it stays open to let fast-pause genes reach the hot tail (up to HSPA1A ~87/min).
 LOAD_RATE_MAX = 0.30
-# ACTIVITY-COUPLED PRE-INITIATION dwell (s). The re-initiation cycle is loadwait+pre_init+pause, so a long
-# pre-init throttles output. Coupled to activity rank (log-linear: dwell = exp(log(SLOW)*(1-rank) +
-# log(FAST)*rank), set in the activity post-pass) so active promoters re-fire fast (pre-loaded PIC) and
-# quiet ones stay slow -- a uniform fast pre-init would lift the bulk into 'moderate' and break the Zipf shape.
-PRE_INIT_DWELL_FAST_S = 2.0    # active genes: pre-init at the tick floor (steric regime)
-PRE_INIT_DWELL_SLOW_S = 30.0   # quietest genes: de-novo PIC assembly, slow
+# Pre-initiation dwell (s), coupled to activity rank (log-linear, set in the activity post-pass) so active
+# promoters re-fire fast (pre-loaded PIC) and quiet ones stay slow.
+PRE_INIT_DWELL_FAST_S = 2.0    # active genes: pre-init at the tick floor
+PRE_INIT_DWELL_SLOW_S = 30.0   # quietest genes: slow de-novo PIC assembly
 # Premature-termination rate /s at the pause; productive_fraction = k_release/(k_release+this).
-# 0.025 centers productive_fraction at ~0.20-0.25 (STL-seq; Mukherjee & Guertin).
+# 0.025 centers productive_fraction at ~0.20-0.25 (STL-seq; Mukherjee & Guertin 2025, ~1 in 4 productive).
 RNAP_PAUSE_TERM_RATE = 0.025
 # 3'-termination/unbind rate /s for a Pol in the termination window (and the legacy single-slot dwell).
 RNAP_UNBIND_RATE = 0.005677
-# 3' TERMINATION WINDOW: a Pol reaching the TES walks downstream through a per-gene window (lognormal,
-# sites=kb) before releasing, vacating the TES on the first step so the 3' end no longer caps output at
-# 1/dwell. Schwalb 2016 (TT-seq): window median ~3.3 kb past the pA site, up to >10 kb. 0 = legacy slot.
+# 3' TERMINATION WINDOW: a Pol reaching the TES walks downstream through a per-gene window (lognormal) before
+# releasing, vacating the TES on the first step so the 3' end no longer caps output at 1/dwell. Schwalb 2016
+# (TT-seq): median read-through window ~3.3 kb past the pA site; the >10 kb tail is the model's draw. 0 = slot.
 TERM_WINDOW_KB_MEDIAN = 3.3        # median 3' termination-window width (Schwalb 2016)
-TERM_WINDOW_SIGMA = 0.8            # lognormal sigma -> ~8% of genes have windows >10 kb
+TERM_WINDOW_SIGMA = 0.8            # lognormal sigma -> model draws ~8% of windows >10 kb
 # Decelerated speed of a terminating Pol crawling the window (Cortazar 2019: ~0.7-0.9 kb/min); sets
 # rnapii_termination_step_prob -> ~1-3 min total termination time.
 TERM_SPEED_KB_PER_SECOND = 0.017
-# Elongation speed MEDIAN anchor (kb/min = 60*this); per gene drawn log-normally (ELONG_LOGNORM_SIGMA)
-# and soft-saturated into [ELONG_MIN, ELONG_MAX], so elongation is GENE-VARIABLE. Human in-vivo ~0.5-6 kb/min,
-# median ~1.5-2.4 (Veloso 2014, Jonkers & Lis 2015, Danko 2013; HeLa fast genes up to ~6, Fuchs 2014).
-# 0.035 kb/s = 2.1 kb/min. Per-gene speed sets each gene's elongation_step_prob; the global rnapii_stride is
-# sized for ELONG_MAX so step_prob<=1 (at 250 bp/2 s, 6 kb/min = 0.8 sites/tick -> stride still 1).
+# Elongation speed MEDIAN anchor (kb/min = 60*this); per gene drawn log-normally and soft-saturated into
+# [ELONG_MIN, ELONG_MAX], so elongation is GENE-VARIABLE. In-vivo median ~1.5 kb/min (Veloso 2014), 0.5->2-5
+# kb/min position-dependent (Jonkers & Lis 2015), up to ~6 in HeLa (Fuchs 2014). 0.035 kb/s = 2.1 kb/min.
 RNAP_SPEED_KB_PER_SECOND = 0.035
-# Per-gene log-normal spread of elongation speed (ln sigma). 0.45 -> ~0.5-6 kb/min range; with the soft knee
-# below, <1% of genes reach the ceiling (was a ~6-8% hard pile-up at 4.0 before MAX was raised + softened).
+# Per-gene log-normal spread of elongation speed (ln sigma); 0.45 with the soft knee below -> ~0.5-6 kb/min.
 ELONG_LOGNORM_SIGMA = 0.45
-# Clamp (kb/min) on per-gene speed (human in-vivo range): MIN keeps slow genes resolvable, MAX caps the fast
-# tail and sizes the global stride so step_prob <= 1. The MAX is applied as a SMOOTH (tanh) saturation above
-# ELONG_SOFT_KNEE rather than a hard np.clip, so the fast tail asymptotes toward MAX instead of piling up as a
-# delta-spike exactly on it (a hard clamp at 4.0 produced a visible histogram spike). 6.0 = realism-band upper edge.
+# Clamp (kb/min) on per-gene speed (in-vivo range): MIN keeps slow genes resolvable; MAX caps the fast tail
+# and sizes the global stride so step_prob <= 1. Applied as a SMOOTH (tanh) saturation above ELONG_SOFT_KNEE
+# (not a hard clip) so the fast tail asymptotes toward MAX instead of piling up on it.
 ELONG_MIN_KB_PER_MIN = 0.5
 ELONG_MAX_KB_PER_MIN = 6.0
-ELONG_SOFT_KNEE_KB_PER_MIN = 4.5   # speeds above this saturate smoothly toward ELONG_MAX (no hard pile-up)
+ELONG_SOFT_KNEE_KB_PER_MIN = 4.5   # speeds above this saturate smoothly toward ELONG_MAX
 # POSITIVE activity->elongation coupling (log-linear tilt by activity rank, in the post-pass): active genes
-# elongate faster (Kwak & Lis 2014, Danko 2013 -- velocity correlates weakly-moderately with expression).
-# mult = exp(COUPLING*(rank-0.5)); 0 = independent. Kept weak: faster elongation lowers body density and so
-# INFLATES the pausing index, so a strong coupling worsens PI. Also bounds the over-dense (active+slow) tail.
+# elongate faster (Danko 2013, elongation-rate vs body-density rho~0.46; Kwak & Lis 2013). Kept weak: faster
+# elongation lowers body density and so inflates the pausing index. mult = exp(COUPLING*(rank-0.5)); 0 = off.
 ELONG_ACTIVITY_COUPLING = 0.3
 # ACTIVITY-DEPENDENT SINGLE-POL PAUSE DWELL = 1/(k_release + k_term). Both pause-exit rates are scaled per
-# gene by a log-linear factor of the activity RANK so dwell is ANTI-correlated with activity: active genes
-# clear the pause in seconds (CDK9/P-TEFb; Gressel 2017), quiet/poised genes stay paused longer (Adelman &
-# Lis 2012). Scaling BOTH rates by the same factor leaves productive_fraction -- and the output bands -- unchanged.
-# Target MEDIAN dwell (s): after the activity ramp all rates are renormalised by one global constant so the
-# median lands here (ratio-invariant, so productive_fraction is untouched). 42 s = human live-cell paused
-# residence (Steurer 2018). NB PI ~= 0.73 x dwell here, so dwell 42 pushes median pausing_index ~30.
+# gene by a log-linear factor of activity RANK so dwell is ANTI-correlated with activity (CDK9/P-TEFb shortens
+# the pause: Gressel 2017; pausing is prominent at poised genes: Adelman & Lis 2012). Scaling BOTH rates by
+# the same factor leaves productive_fraction unchanged. After the ramp all rates are renormalised so the
+# median lands at PAUSE_DWELL_MEDIAN_S. 42 s = human live-cell paused residence (Steurer 2018).
 PAUSE_DWELL_MEDIAN_S = 42.0
-# SYSTEMATIC activity trend (ln full width across the rank range): m(rank=1)=exp(SPREAD/2),
-# m(rank=0)=exp(-SPREAD/2). 2.2 -> most active genes pause ~3x shorter than median, least active ~3x longer.
+# Systematic activity trend (ln full width across the rank range): 2.2 -> most active genes pause ~3x shorter
+# than median, least active ~3x longer.
 PAUSE_DWELL_ACTIVITY_SPREAD = 2.2
-# CONVEX top-decile fast-pause boost: the linear SPREAD ramp saturates near rank 1 (exp(SPREAD/2)~3x), so the
-# very top genes' dwell barely differs across the top decile -> their re-initiation rate (~1/dwell) saturates
-# and the highest-output genes pile on a FLAT CEILING in the output-rank plot. This adds extra ln-shortening
-# applied ONLY over rank 0.9->1.0 (factor exp(BOOST) at rank 1), so the very top genes keep stretching toward
-# PAUSE_MIN and the output tail spreads into a smooth heavy tail. Deterministic in rank (no rng draw); the
-# median-pin bisection re-pins the BULK median, so only the active tail moves. 0 = off (legacy plateau).
+# Extra ln-shortening applied ONLY over rank 0.9->1.0 so the very top genes keep stretching toward PAUSE_MIN
+# (re-initiation ~1/dwell) and the output tail stays a smooth heavy tail instead of a flat ceiling. 0 = off.
 PAUSE_DWELL_TOPTAIL_BOOST = 1.3
-# Per-gene log-normal SCATTER on the dwell ramp (dwell_mult *= exp(NOISE*N(0,1))). Real pausing is set
-# mostly by promoter architecture and only loosely by activity (Day 2016 Spearman ~0.18; Zimmer 2021), so
-# this loosens the ramp into a realistic trend-with-scatter. Mean-zero in log, so it doesn't bias the pinned
-# median. 0 = deterministic ramp.
+# Per-gene log-normal scatter on the dwell ramp: real pausing is set mostly by promoter architecture and only
+# loosely by activity (Day 2016 Spearman ~0.18; Zimmer 2021). Mean-zero in log. 0 = deterministic ramp.
 PAUSE_DWELL_ACTIVITY_NOISE = 0.2
-# Hard clamp on the single-Pol dwell (s), applied to the common rate scale (never perturbs
-# productive_fraction). FLOOR keeps a resolvable pause peak; CEILING bounds the quiet tail. Applied AFTER
-# the median pin, so it only trims the extreme tails.
+# Hard clamp on the single-Pol dwell (s), applied to the common rate scale (never perturbs productive_fraction)
+# AFTER the median pin, so it only trims the extreme tails.
 PAUSE_MIN_S = 2     # tick floor: let the hottest pauses collapse into the steric regime
 PAUSE_MAX_S = 90
-# ACTIVITY-DEPENDENT PRODUCTIVE FRACTION (full-range gradient on the k_release/k_term RATIO): real pf is
-# activity-graded (quiet 0.1-0.25, moderate 0.2-0.4, active 0.4-0.8; Mukherjee & Guertin k_pre/k_rel~2.6 ->
-# ~1/4 productive for a typical gene, but high-output genes terminate less prematurely -- Gressel 2019,
-# Erickson 2018). The dwell ramp scales k_release and k_term TOGETHER (ratio-invariant -> pf untouched); this
-# changes the RATIO. k_term is reduced for ACTIVE genes (rank>0.5 -> pf up) with a convex extra drop over the
-# top decile, and (mildly) raised for QUIET genes (rank<0.5 -> pf down). Kept asymmetric and quiet-light:
-# quiet genes already sit ~0.18 (in band) and lowering their pf also lowers their OUTPUT (pushes them toward
-# silent), so the quiet gain is small -- the load level (RNAP_LOAD_RATE) does the bin shaping, this knob mainly
-# lifts the moderate/active tail. Deterministic in rank -> NO new rng draw. Keep the realism MEDIAN <= 0.30.
-# factor(rank<0.5)=exp(QUIET_GAIN*(0.5-rank)*2); factor(rank>=0.5)=exp(-ACTIVE_GAIN*(rank-0.5)*2);
-# then *= exp(-ACTIVE_TOPBOOST*clip((rank-0.9)/0.1,0,1)). NB do NOT also jitter k_term (compounds).
-PF_QUIET_GAIN = 0.2       # ln k_term boost at rank 0 (quiet -> slightly lower pf); kept small to not over-silence
+# ACTIVITY-DEPENDENT PRODUCTIVE FRACTION (gradient on the k_release/k_term RATIO): real pf is activity-graded
+# (quiet ~0.1-0.25, active ~0.4-0.8; Mukherjee & Guertin 2025 k_pre/k_rel~2.6 -> ~1/4 productive for a typical
+# gene, high-output genes terminate less prematurely -- Gressel 2019). The dwell ramp scales k_release and
+# k_term together (ratio-invariant); this changes the RATIO: k_term reduced for ACTIVE genes (pf up), mildly
+# raised for QUIET genes (pf down). Deterministic in rank. Keep the realism MEDIAN <= 0.30.
+PF_QUIET_GAIN = 0.2       # ln k_term boost at rank 0 (quiet -> slightly lower pf)
 PF_ACTIVE_GAIN = 1.1      # ln k_term reduction at rank 1 before the top boost (active -> higher pf)
 PF_ACTIVE_TOPBOOST = 0.8  # extra convex ln k_term reduction over rank 0.9->1.0 (hottest genes -> pf ~0.5-0.7)
 
 # ============== Activity distribution (loading heterogeneity) ============
-# Per-gene loading is drawn from a POWER-LAW (Zipf): the real transcriptome is power-law -- most genes
-# lowly expressed, a thin heavy tail high (Furusawa & Kaneko 2003; top ~600 genes ~ half the mRNA). The
-# heavy tail pulls the GEOMETRIC MEAN up, so renormalising it to RNAP_LOAD_RATE leaves the mode (most
-# genes) far below -> a bottom-heavy 'low'-dominant output. Multiplier m ~ m^(-ALPHA) on [1, RANGE].
-LOAD_POWERLAW_ALPHA = 2.4     # steeper -> more bottom-heavy (more QUIET, fewer moderate/active at fixed geo-mean)
+# Per-gene loading is drawn from a POWER-LAW (Zipf): the real transcriptome is power-law -- most genes lowly
+# expressed, a thin heavy tail high (Furusawa & Kaneko 2003). The heavy tail pulls the GEOMETRIC MEAN up, so
+# renormalising it to RNAP_LOAD_RATE leaves the mode far below -> a bottom-heavy 'low'-dominant output.
+LOAD_POWERLAW_ALPHA = 2.4     # steeper -> more bottom-heavy at fixed geo-mean
 LOAD_POWERLAW_RANGE = 3000.0  # max/min multiplier (dynamic range)
-LOAD_LOGNORM_SIGMA = 1.3      # on/off gate for loading heterogeneity (>0 = on); spread set by power-law above
-# Per-class fraction of genes forced NOT-DETECTED (cell-type/developmental off in this cell). This is the
-# force-silenced pool, split below into truly-off + ultra-low; sized so the NOT-DETECTED total (= detected
-# complement) lands ~30-40% genome-wide -> ~60-70% detected.
+LOAD_LOGNORM_SIGMA = 1.3      # on/off gate for loading heterogeneity (>0 = on)
+# Per-class fraction of genes forced NOT-DETECTED (cell-type/developmental off in this cell); sized so the
+# not-detected total lands ~30-40% genome-wide -> ~60-70% detected.
 SILENT_PROB = {"hk_const": 0.0, "hk_high": 0.0, "celltype": 0.27, "dev": 0.56}
-LOAD_SILENT_FRAC = 0.0         # DEPRECATED/unused (silent genes now split into hard-off + ultra-low, below).
-# THREE-CLASS not-detected structure (user spec): of ALL allele-instances ~15-25% TRULY OFF (load_prob 0, no
-# meaningful promoter loading -> output 0), ~10-20% ULTRA-LOW / below-detection (rare leakage ~0.001-0.05
-# completions/h/allele), ~60-70% DETECTED. SILENT_PROB (above) sets the force-silenced = not-detected pool;
-# SILENT_HARD_FRAC splits that pool into truly-off vs ultra-low; ultra-low genes draw a LOG-UNIFORM load_prob
-# over LOAD_ULTRALOW_RANGE (-> ~0.001-0.05/h output; sim-validated). Real expression is a continuum (Ramskold
-# 2009): a deep-off population + a basal-leakage tail + the detected lobe, not a single hard spike at 0.
-SILENT_HARD_FRAC = 0.5               # of force-silenced genes: fraction TRULY OFF (load 0); the rest are ultra-low
-LOAD_ULTRALOW_RANGE = (2e-6, 1e-4)   # load_prob (log-uniform) for ultra-low genes -> ~0.001-0.05 completions/h/allele
+LOAD_SILENT_FRAC = 0.0         # DEPRECATED/unused (silent genes split into hard-off + ultra-low, below).
+# Not-detected structure: of all alleles ~15-25% TRULY OFF (load 0), ~10-20% ULTRA-LOW (rare leakage
+# ~0.001-0.05 completions/h), ~60-70% DETECTED. SILENT_PROB sets the not-detected pool; SILENT_HARD_FRAC
+# splits it into truly-off vs ultra-low (the latter draw a log-uniform load_prob over LOAD_ULTRALOW_RANGE).
+# Real expression is a continuum, not a hard spike at 0 (Ramskold 2009).
+SILENT_HARD_FRAC = 0.5               # of force-silenced genes: fraction TRULY OFF (load 0); rest ultra-low
+LOAD_ULTRALOW_RANGE = (2e-6, 1e-4)   # load_prob (log-uniform) for ultra-low genes -> ~0.001-0.05 completions/h
 LOAD_TADSIZE_EXPONENT = 0.2    # loading factor = (median_TAD_size / TAD_size)^this (small TADs more active)
 
 # ============== RNAPII <-> cohesin coupling (moving barrier) =============
@@ -221,9 +190,9 @@ BSTR_TXN_WEIGHT = 0.5          # boundary strength = this*flank_txn + (1-this)*f
 # =========================== Gene classes & mix ==========================
 # frac = genome fraction (documentation-only; class is drawn per TAD from FRAC_ACTIVE/FRAC_POOR below);
 # init = PRE-INITIATION->PAUSED prob range (ref 20 s); prel = pause-release rate range k_release (ref 20 s);
-# req = enhancer-gated; nenh = (min,max) enhancers. hk_const/hk_high = housekeeping (~20% of genes;
-# Eisenberg & Levanon 2013), celltype = cell-type-specific, dev = developmental. init is HIGH (fast
-# pre-init, ~5-9 s) so the PAUSE -- not pre-initiation -- gates the occlusion re-initiation cycle.
+# req = enhancer-gated; nenh = (min,max) enhancers. hk_const/hk_high = housekeeping (~3800 genes, ~20%;
+# Eisenberg & Levanon 2013 list 3804), celltype = cell-type-specific, dev = developmental. init is HIGH (fast
+# pre-init) so the PAUSE -- not pre-initiation -- gates the occlusion re-initiation cycle.
 CLASSES = {
     "hk_const": dict(frac=0.15, init=(0.93, 0.97), prel=(0.098, 0.145), req=False, nenh=(0, 0)),
     "hk_high":  dict(frac=0.05, init=(0.95, 0.98), prel=(0.123, 0.193), req=False, nenh=(0, 1)),
@@ -239,28 +208,26 @@ FRAC_ACTIVE = np.array([0.22, 0.06, 0.64, 0.08])   # mix in max-txn TADs
 FRAC_POOR   = np.array([0.08, 0.01, 0.48, 0.43])   # mix in min-txn TADs (celltype-heavy + dev silent)
 
 # ===================== Per-class output stratification ===================
-# Three class-conditioned levers lift housekeeping output toward the ~1/min mRNA median (cell-type/dev
-# stay at lincRNA/poised level):
+# Three class-conditioned levers lift housekeeping output toward the ~1/min mRNA median (cell-type/dev stay
+# at lincRNA/poised level):
 #   (1) LOADING -- hk promoters are strongly loaded (CLASS_LOAD_MULT; relative, renormalized).
 #   (2) PREMATURE TERMINATION -- hk genes terminate LESS at the pause (higher productive_fraction; per-class
 #       k_term in CLASS_PAUSE_TERM_RATE; engine reads per-gene pause_term_prob, falls back to global).
-#   (3) 3' TERMINATION DWELL -- active genes terminate faster (residence anti-correlated with rate, Erickson
-#       2018; CLASS_UNBIND_RATE). The readthrough WINDOW is left uniform (CLASS_TERM_WINDOW_MULT all 1.0).
+#   (3) 3' TERMINATION DWELL -- active genes terminate faster (CLASS_UNBIND_RATE). The readthrough WINDOW is
+#       left uniform (CLASS_TERM_WINDOW_MULT all 1.0).
 CLASS_LOAD_MULT = {"hk_const": 1.8, "hk_high": 2.5, "celltype": 1.0, "dev": 0.7}
-# Per-gene log-normal JITTER (ln sigma) on the EMITTED loading rate, applied AFTER the rank/dwell/pf post-pass
-# (so it perturbs ONLY the emitted load_prob -- never the activity rank, the force-silent mask, or the dwell
-# rng stream, which all stay byte-identical). Turns the 4 sharp CLASS_LOAD_MULT loading levels into OVERLAPPING
-# lobes so the realized INITIATION distribution is continuous instead of bimodal-with-a-trough (real expression
-# has no clean class modes; Furusawa & Kaneko 2003, Eisenberg & Levanon 2013). Mean-zero in log -> expressed
-# geo-mean ~preserved. Silent genes are exempt (kept at their floor). 0 = legacy hard class steps.
+# Per-gene log-normal jitter (ln sigma) on the EMITTED loading rate, applied AFTER the rank/dwell/pf post-pass
+# (perturbs only load_prob, never the activity rank / silent mask / dwell rng -- all stay byte-identical).
+# Turns the 4 CLASS_LOAD_MULT levels into overlapping lobes so the realized initiation distribution is
+# continuous rather than bimodal. Mean-zero in log. Silent genes exempt. 0 = legacy hard class steps.
 CLASS_LOAD_MULT_LOGSIGMA = 0.5
 CLASS_PAUSE_TERM_RATE = {"hk_const": 0.020, "hk_high": 0.016, "celltype": 0.028, "dev": 0.038}
 CLASS_TERM_WINDOW_MULT = {"hk_const": 1.0, "hk_high": 1.0, "celltype": 1.0, "dev": 1.0}
 # Per-class gene-length multiplier on the lognormal median: housekeeping COMPACT, developmental LONGER
 # (Eisenberg & Levanon 2003).
 CLASS_GENE_LEN_MULT = {"hk_const": 0.7, "hk_high": 0.7, "celltype": 1.15, "dev": 1.6}
-# Per-class 3' termination/unbind rate /s, anti-correlated with activity (Erickson 2018): hk terminate
-# faster (~1.5-2 min dwell), dev slower (~3.7 min). Sets per-gene termination_prob (falls back to RNAP_UNBIND_RATE).
+# Per-class 3' termination/unbind rate /s, anti-correlated with activity: hk terminate faster (~1.5-2 min
+# dwell), dev slower (~3.7 min). Sets per-gene termination_prob (falls back to RNAP_UNBIND_RATE).
 CLASS_UNBIND_RATE = {"hk_const": 0.007, "hk_high": 0.0085, "celltype": 0.006, "dev": 0.0045}
 
 
@@ -406,14 +373,14 @@ def gen_tads(rng, s_small_kb=SHORT_SPACING, s_large_kb=LONG_SPACING):
 
 def gene_length(rng, cls=""):
     """Genomic span (TSS->TES) in SITES: lognormal median 24 kb x CLASS_GENE_LEN_MULT, sigma 1.3
-    (mean ~56 kb, ~14% >100 kb; matches Piovesan 2019)."""
+    (model mean ~56 kb, tail >100 kb; cf. human median ~26 kb, Piovesan 2019)."""
     med = 24.0 * CLASS_GENE_LEN_MULT.get(cls, 1.0) * 1000.0 / BP_PER_SITE   # median in SITES
     return int(np.clip(rng.lognormal(mean=np.log(med), sigma=1.3), kb2sites(3), kb2sites(800)))
 
 
 def term_window(rng, cls=""):
-    """3' termination-window length in SITES downstream of the TES: lognormal median ~3.3 kb
-    x CLASS_TERM_WINDOW_MULT, tail to >10 kb (Schwalb 2016 TT-seq); clipped to [1, 20] kb."""
+    """3' termination-window length in SITES downstream of the TES: lognormal median ~3.3 kb (Schwalb 2016
+    TT-seq) x CLASS_TERM_WINDOW_MULT, model tail to >10 kb; clipped to [1, 20] kb."""
     med = TERM_WINDOW_KB_MEDIAN * CLASS_TERM_WINDOW_MULT.get(cls, 1.0) * 1000.0 / BP_PER_SITE
     return int(np.clip(rng.lognormal(mean=np.log(med), sigma=TERM_WINDOW_SIGMA),
                        kb2sites(1), kb2sites(20)))
@@ -470,7 +437,7 @@ def _add_enhancers(rng, g, C, lo, hi, strand):
     med_dist = 30.0 * 1000.0 / BP_PER_SITE      # median E-P distance ~30 kb, in SITES
     for _e in range(ne):
         dist = int(np.clip(rng.lognormal(np.log(med_dist), 1.0),
-                           kb2sites(5), kb2sites(800)))  # median ~30 kb (Gasperini 2019), heavy tail to ~500 kb
+                           kb2sites(5), kb2sites(800)))  # model median ~30 kb (cf. measured ~24 kb, Gasperini 2019)
         sign = 1 if rng.random() < 0.5 else -1     # up/downstream with equal prob
         e = tss + sign * dist
         if rng.random() < 0.10:               # ~10% cross a TAD boundary (modeling assumption)
@@ -683,8 +650,8 @@ def build(txn_on, bounds, bstrength, genes, calibration, num_chains=4, separatio
     # Decelerated step prob for a Pol crawling the 3' termination window (Cortazar 2019 ~0.7-0.9 kb/min);
     # vacates the TES quickly so the 3' end stops capping output at 1/dwell.
     rnapii_termination_step_prob: {round(calibration["rnapii_termination_step_prob"], 6)}
-    # Banigan moving barrier (per-encounter probs, tick-independent): elongating RNAP wins head-on and
-    # pushes the converging cohesin; co-directional contact mostly only slows it (head-on push ~0.72).
+    # Banigan moving barrier (per-encounter probs, tick-independent): an elongating RNAP wins head-on and
+    # pushes the converging cohesin leg; co-directional (trailing) contact only impedes it.
     rnapii_stall_prob: {RNAP_STALL_PROB}
     rnapii_push_prob: {RNAP_PUSH_PROB}
     rnapii_headon_push_prob: {RNAP_HEADON_PUSH_PROB}

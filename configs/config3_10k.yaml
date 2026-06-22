@@ -35,8 +35,8 @@ lef:
     # Decelerated step prob for a Pol crawling the 3' termination window (Cortazar 2019 ~0.7-0.9 kb/min);
     # vacates the TES quickly so the 3' end stops capping output at 1/dwell.
     rnapii_termination_step_prob: 0.136
-    # Banigan moving barrier (per-encounter probs, tick-independent): elongating RNAP wins head-on and
-    # pushes the converging cohesin; co-directional contact mostly only slows it (head-on push ~0.72).
+    # Banigan moving barrier (per-encounter probs, tick-independent): an elongating RNAP wins head-on and
+    # pushes the converging cohesin leg; co-directional (trailing) contact only impedes it.
     rnapii_stall_prob: 0.0
     rnapii_push_prob: 0.0
     rnapii_headon_push_prob: 1.0

@@ -1,18 +1,14 @@
 #!/usr/bin/env python
-"""RNAP-off boundary-strength sweep at the 1D LEF stage.
-
-Given a baseline config1 YAML and its existing ``LEFPositions.h5``, this script
-generates RNAP-off derivative configs with explicit CTCF boundary strengths
-multiplied by requested factors, runs/reuses their 1D trajectories, and reports
-fold changes versus the baseline replicate-chain mean.
+"""RNAP-off boundary-strength sweep at the 1D LEF stage: generates RNAP-off
+configs with CTCF boundary strengths scaled by requested factors, runs/reuses
+their 1D trajectories, and reports fold changes versus the baseline mean.
 """
 from __future__ import annotations
 
 import os
 
-# Pin BLAS/OpenMP to one thread BEFORE numpy is imported so that running many 1D
-# sims under --jobs does not oversubscribe cores (each sweep point is numpy-light;
-# parallelism comes from running whole sims concurrently, not threaded BLAS).
+# Pin BLAS/OpenMP to one thread BEFORE numpy is imported so --jobs does not
+# oversubscribe cores; parallelism comes from concurrent sims, not threaded BLAS.
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
@@ -57,8 +53,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm  # noqa: E402
 
-# Diverging fold-change colormap: slate-blue (below baseline) -> white (fold=1.0,
-# the TwoSlopeNorm center) -> brick-red (above baseline).
+# Diverging fold-change colormap: blue (below baseline) -> white (fold=1.0,
+# the TwoSlopeNorm center) -> red (above baseline).
 FOLD_CMAP = LinearSegmentedColormap.from_list(
     "fold_slate_red", ["#465775", "#ffffff", "#A63446"]
 )
@@ -215,10 +211,7 @@ def make_sweep_config(base_cfg: dict, multiplier: float) -> tuple[dict, list[dic
 
 
 def _run_sweep_point(task: dict) -> dict:
-    """Worker: run (or reuse) the 1D LEF stage for one sweep multiplier and return
-    its resolved H5 path. Top-level + picklable so it can be dispatched to a
-    process pool. Each process re-seeds numpy from the config seed inside
-    ``lef.run``, so results are deterministic and isolated from sibling workers."""
+    """Run (or reuse) the 1D LEF stage for one sweep multiplier; return its H5 path."""
     resolved = _resolve_h5(
         cfg_path=Path(task["cfg_path"]),
         requested_h5=Path(task["h5_path"]),
@@ -230,11 +223,7 @@ def _run_sweep_point(task: dict) -> dict:
 
 
 def _analyze_sweep_point(task: dict) -> dict:
-    """Worker: analyze one resolved H5 into its selected metric rows. Top-level +
-    picklable so the post-run analysis can use the same process pool as the runs.
-    ``analyze_run`` only reads the H5 and computes (no shared state, no RNG), so a
-    pooled map is identical to the sequential loop -- and ``ex.map`` preserves
-    input order, so the concatenated frame is byte-identical to before."""
+    """Analyze one resolved H5 into its selected metric rows."""
     core_rows, boundary_metric_rows, _, _ = analyze_run(
         task["label"], Path(task["cfg_path"]), Path(task["h5"]), task["base_topology"]
     )
@@ -272,19 +261,15 @@ def selected_metric_rows(core_rows: list[dict], boundary_rows: list[dict]) -> pd
 
 
 def _perm_pvalue_worker(payload: tuple) -> tuple:
-    """Worker: one independent permutation p-value (top-level + picklable).
-    ``_two_sample_permutation_pvalue`` reseeds ``default_rng(12345)`` per call, so
-    it is deterministic and order-independent -> pooled == sequential, byte-identical."""
+    """One permutation p-value. ``_two_sample_permutation_pvalue`` reseeds
+    ``default_rng(12345)`` per call, so pooled results equal the sequential ones."""
     key, base_values, comp_values = payload
     return key, _two_sample_permutation_pvalue(base_values, comp_values)
 
 
 def _permutation_pvalues(arrays: dict, jobs: int) -> dict:
-    """Permutation p-value for every (label, metric) pair. Each is a fixed
-    200k-iteration Monte Carlo that dominates summarize_sweep, and they are mutually
-    independent and identically seeded, so with ``jobs > 1`` they run across a
-    process pool -- byte-identical to the sequential computation, just concurrent.
-    Pure-CPU work, so it scales with cores (unlike the I/O-bound H5 analysis)."""
+    """Permutation p-value for every (label, metric) pair, optionally over a
+    process pool. Each is identically seeded, so pooled == sequential."""
     if jobs <= 1:
         return {key: _two_sample_permutation_pvalue(b, c) for key, (b, c) in arrays.items()}
     ctx = mp.get_context("fork")
@@ -306,9 +291,8 @@ def summarize_sweep(
     baseline_means = baseline.groupby("metric")["raw_value"].mean().to_dict()
     baseline_medians = baseline.groupby("metric")["raw_value"].median().to_dict()
 
-    # Extract each (label, metric) pair's baseline + comparison per-chain arrays once
-    # (identical values/order to the former in-loop extraction), then compute the
-    # permutation p-values -- the dominant cost -- in one (optionally parallel) batch.
+    # Extract each (label, metric) pair's baseline + comparison arrays once, then
+    # compute the permutation p-values in one (optionally parallel) batch.
     base_by_metric = {
         m: baseline[baseline["metric"] == m]["raw_value"].to_numpy(dtype=float)
         for m in METRIC_ORDER
@@ -329,9 +313,8 @@ def summarize_sweep(
             baseline_mean = float(np.nanmean(base_values)) if base_values.size else float("nan")
             comp_mean = float(np.nanmean(comp_values)) if comp_values.size else float("nan")
             fold = comp_mean / baseline_mean if baseline_mean else float("nan")
-            # SD of the per-chain fold (raw_value / baseline_mean). Since the
-            # baseline mean is a per-metric constant, this is sd(comp)/baseline_mean,
-            # i.e. consistent with the fold mean above.
+            # SD of the per-chain fold: baseline mean is a per-metric constant, so
+            # this is sd(comp)/baseline_mean, consistent with the fold mean above.
             comp_sd = (
                 float(np.nanstd(comp_values, ddof=1))
                 if int(np.isfinite(comp_values).sum()) > 1
@@ -339,10 +322,8 @@ def summarize_sweep(
             )
             fold_sd = comp_sd / baseline_mean if baseline_mean else float("nan")
 
-            # Median-across-replicates fold: median raw comparison chain value
-            # divided by the median raw baseline chain value. The spread is the
-            # median absolute deviation of comparison chains, expressed in the
-            # same baseline-median units so it is consistent with the fold above.
+            # Median-across-replicates fold: comparison median / baseline median.
+            # Spread is the comparison MAD in baseline-median units, consistent with the fold.
             baseline_median = float(np.nanmedian(base_values)) if base_values.size else float("nan")
             comp_median = float(np.nanmedian(comp_values)) if comp_values.size else float("nan")
             fold_median = comp_median / baseline_median if baseline_median else float("nan")
@@ -464,8 +445,7 @@ def plot_heatmaps(
     fig.suptitle(title, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # bbox_inches="tight" expands the saved canvas to include the now-larger axis
-    # tick labels so none are clipped at the figure edge.
+    # bbox_inches="tight" expands the canvas so large tick labels are not clipped.
     fig.savefig(out_path, format="svg", bbox_inches="tight")
     fig.savefig(out_path.with_suffix(".png"), format="png", bbox_inches="tight")
     plt.close(fig)
@@ -522,7 +502,7 @@ def main() -> None:
     sweep_display_labels = []
     generated_paths = {}
 
-    # 1) generate every sweep config (cheap; always sequential) -----------
+    # 1) generate every sweep config (always sequential) ------------------
     tasks = []
     for multiplier in args.multipliers:
         label = multiplier_label(multiplier)
@@ -572,10 +552,8 @@ def main() -> None:
             res = _run_sweep_point(task)
             resolved_h5[res["label"]] = Path(res["h5"])
     else:
-        # Process pool: each sweep point is an independent process that re-seeds
-        # numpy from the config and writes its own H5 -> identical to sequential,
-        # just concurrent. A fork context avoids re-importing this module (and
-        # matplotlib) in every worker.
+        # Each sweep point re-seeds numpy from its config -> identical to sequential.
+        # Fork context avoids re-importing this module (and matplotlib) per worker.
         print(f"running {total} sweep points with --jobs {jobs} (process pool, fork context)")
         ctx = mp.get_context("fork")
         n = 0
@@ -585,9 +563,7 @@ def main() -> None:
                 print(f"[{n}/{total}] done {res['label']}")
                 resolved_h5[res["label"]] = Path(res["h5"])
 
-    # 3) analyze each resolved H5 (sequential or the same process pool). ex.map
-    #    preserves multiplier order, and analyze_run is read-only/deterministic,
-    #    so the concatenated result is identical to the sequential version.
+    # 3) analyze each resolved H5 (sequential or the same process pool).
     analysis_tasks = [
         {
             "label": task["label"],

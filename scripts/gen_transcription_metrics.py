@@ -1,69 +1,30 @@
 #!/usr/bin/env python
-"""Transcription-kinetics metrics for a transcription-ON (RNAPII-enabled) config.
+"""Per-gene + locus-aggregate transcription-kinetics metrics for a transcription-ON config.
 
-Given ONE config (and optionally its ``LEFPositions.h5``; the 1D stage is run or
-reused if absent), this measures per-gene + locus-aggregate transcription rates
-DIRECTLY from the RNAPII trajectory -- no analytic formula. It is the
-transcription counterpart to ``gen_lesion_grid_and_heatmaps.py``'s measured
-cohesin-stall readout, and reuses the same ``_resolve_h5`` 1D runner.
+Invoked as ``gen_transcription_metrics.py --config CONFIG.yaml [--h5 LEFPositions.h5]``;
+the 1D stage is run or reused (via ``_resolve_h5``) if the H5 is absent. Metrics are
+measured DIRECTLY from the RNAPII trajectory (no analytic formula).
 
-The trajectory exposes (see ner_rnapii_3d/engine/simulate.py):
+The trajectory (see ner_rnapii_3d/engine/simulate.py) exposes:
 
   * ``rnapii_positions`` (T, R, 2) = [global_site, gene_id], -1 = absent.
   * ``rnapii_states``    (T, R)    = PRE-INITIATION/PAUSED/ELONGATING/TERMINATING/STALLED.
   * ``rnapii_ids``       (T, R)    = stable per-RNAPII uid (survives column reshuffle
                                      on unload) -> reconstructs each polymerase's
-                                     load -> unload life, the basis for completion
-                                     counts, per-molecule velocity and dwell times.
+                                     load -> unload life (completion counts, velocity, dwell).
   * ``genes``            struct    = (gene_id, tss, tes, direction, load_prob).
   * ``lesions`` / ``positions``    (optional) -> co-transcriptional stall attribution.
 
-Each recorded frame is one tick; ``tick_seconds`` (from the config) converts ticks
-to seconds. Four metric families are computed per gene and as a locus aggregate:
-
-  CORE RATES & DENSITY
-    initiation_rate_per_min    new RNAPII loaded at the TSS / time (bursty input)
-    completion_rate_per_min    RNAPII reaching the TES (= transcript production rate)
-    synthesis_rate_nt_per_s    sites transcribed / time (nascent RNA throughput)
-    pol2_occupancy             mean RNAPII present per tick (ChIP analog, per allele; incl. the 3' window)
-    pol2_density_per_kb        occupancy / gene length (kb)
-    nascent_signal             mean ELONGATING|STALLED RNAPII per tick (engaged)
-    term_zone_occupancy        mean RNAPII in the 3' termination window past the TES (per tick)
-    elongation_velocity_bp_s   sites advanced / elongating-tick (bp/s; excludes the 3' termination crawl)
+Each frame is one tick; ``tick_seconds`` (config) converts ticks to seconds.
 
   Position classes are window-aware: rel = (pos-TSS)*direction; rel<=pause_offset is the
   promoter/pause, pause_offset<rel<=gene_length is the gene body (sets the pausing-index
   denominator), and rel>gene_length is the 3' termination window (Schwalb 2016) -- the last
   is excluded from gene-body density so the pausing index is not diluted by terminating RNAPII.
 
-  PAUSING & STATE KINETICS
-    pausing_index              (TSS..pause-site) / gene-body density (travelling ratio)
-    frac_{pre_initiation,paused,elongating,stalled,terminating}   state-time fractions
-    mean_{pre_initiation,pause,terminating}_dwell_s               per-state residence (s)
-    mean_residence_s           full load->unload transcription time (s)
-    pause_release_efficiency   completed / initiated
-
-  CO-TRANSCRIPTIONAL INTERFERENCE
-    stall_frac                 STALLED / (ELONGATING+STALLED) engaged-time
-    lesion_stall_frac          of STALLED ticks, fraction with a blocking lesion
-                               immediately ahead (NaN if no ``lesions`` dataset)
-    cohesin_stall_frac         of STALLED ticks, fraction with a cohesin leg
-                               immediately ahead (NaN if no ``positions`` dataset)
-
-  TRANSCRIPTIONAL BURSTING
-    active_fraction            fraction of ticks the gene holds >=1 RNAPII
-    burst_rate_per_min         onsets of activity / time
-    mean_burst_size            new RNAPII initiated per active burst
-    mean_burst_duration_s      mean active-interval length (s)
-    mean_interburst_s          mean silent-interval length (s)
-
-Outputs (to ``--out-dir``, default alongside the H5):
-
-  * ``transcription_metrics.tsv``        one row per gene + an ``ALL`` aggregate row.
-  * ``transcription_metrics.svg``        per-gene panels (rates, density, pausing,
-                                         state fractions, velocity, bursting).
-  * ``transcription_tracks.svg``         RNAPII ChIP + nascent per-site tracks,
-                                         folded across alleles onto one locus.
+Outputs (to ``--out-dir``, default alongside the H5): ``transcription_metrics.tsv``
+(one row per gene + an ``ALL`` aggregate), plus per-gene metric panels and folded
+RNAPII ChIP + nascent per-site tracks as SVG/PNG.
 """
 from __future__ import annotations
 
@@ -138,8 +99,13 @@ PF_MIN_EVENTS = 10
 # Minimum mean RNAPII/gene (occupancy) below which the PAUSING INDEX is reported per-gene but NOT aggregated
 # into the realism median: a near-silent gene piles a little promoter signal over an essentially empty body, so
 # its travelling ratio (promoter/body density) is a structural artefact (body denominator ~ counting noise),
-# not biology. Matches the activity_report 'silent (<0.3)' occupancy cut, so 'expressed' is one definition
-# across the report. Day 2016: PI>2 ~ 60% of EXPRESSED genes (not all annotated genes).
+# not biology. This occ>=0.3 cut is the analogue of how Day 2016 defines 'expressed' for PI -- RNA-seq FPKM>=1
+# with low-signal genes filtered out (Day does NOT use a productive-output cutoff). Day 2016: PI>2 at ~60% of
+# expressed genes (33-46% of all RefSeq); the PI>2 threshold is the Rahl 2010 standard. Over this set the model
+# runs pausey (~86% PI>2, median PI ~6) -- at the high end of the literature envelope (Day 2016 ~60% .. Rahl
+# 2010 91% TR>2 for active genes; Core & Adelman 2019: essentially all active genes pause), converging to Day's
+# ~60% only for the most highly-expressed genes (>5 transcripts/h). PI vs expression is hill-shaped in Day 2016
+# (weak Spearman ~0.18), so the model's monotonic PI-falls-with-output trend is an approximation.
 PI_MIN_OCCUPANCY = 0.3
 _BURST_KEYS = [
     "active_fraction", "burst_rate_per_min", "mean_burst_size",
@@ -203,10 +169,7 @@ HUMAN_RANGES: dict[str, dict] = {
 
 
 def realism_report(df: pd.DataFrame) -> pd.DataFrame:
-    """Per-gene median of each trackable metric vs its human-biology range.
-
-    Flags each as OK / LOW / HIGH (median inside / below / above the band) and
-    reports the fraction of genes inside the band."""
+    """Per-gene median of each trackable metric vs its human range, flagged OK/LOW/HIGH."""
     rows = []
     ev = pd.to_numeric(df["initiation_events"], errors="coerce") if "initiation_events" in df.columns else None
     occ = pd.to_numeric(df["pol2_occupancy"], errors="coerce") if "pol2_occupancy" in df.columns else None
@@ -240,7 +203,7 @@ def realism_report(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def print_realism_report(rr: pd.DataFrame) -> None:
-    """Pretty-print the realism table (a '*' marks activity-dependent soft bands)."""
+    """Pretty-print the realism table ('*' marks activity-dependent soft bands)."""
     glyph = {"OK": "OK  ✓", "LOW": "LOW ↓", "HIGH": "HIGH↑"}
     print("\n=== human-biology range check (per-gene median; * = activity-dependent, wide band) ===")
     print(f"  {'metric':26s} {'median':>16s}   {'human range':24s} {'flag':6s} {'in-rng':>6s}  source")
@@ -257,11 +220,9 @@ def print_realism_report(rr: pd.DataFrame) -> None:
 
 
 def activity_report(df: pd.DataFrame) -> dict:
-    """Measure the per-gene transcriptional ACTIVITY distribution (the expression
-    heavy-tail), which the per-metric range check does NOT capture. A typical
-    locus is mostly QUIET with a minority of active genes, spanning orders of
-    magnitude (log-normal / Zipf). Expressed-gene initiation should fall in the
-    human PRO-seq band 0.2-1.5/min."""
+    """Measure the per-gene ACTIVITY distribution (expression heavy-tail) the per-metric
+    range check does not capture: a quiet majority + small active tail; expressed-gene
+    initiation should fall in the human PRO-seq band 0.2-1.5/min."""
     occ = pd.to_numeric(df["pol2_occupancy"], errors="coerce")
     load = pd.to_numeric(df["initiation_rate_per_min"], errors="coerce")   # LOADING (incl. abortive)
     prod = pd.to_numeric(df["completion_rate_per_min"], errors="coerce")   # PRODUCTIVE (reach 3' = transcript)
@@ -304,7 +265,7 @@ def activity_report(df: pd.DataFrame) -> dict:
     print(f"  not-detected (output <0.05/h): {silent_out:.0f}%  of which deep-silent / no-initiation: "
           f"{no_init_pct:.0f}%  (target ~30-40% not-detected; the rest is a graded basal/leaky tail)")
     print(f"  pausing index over EXPRESSED (occ>={PI_MIN_OCCUPANCY:g}): median {pi_med:.1f}; "
-          f"{pi_gt2:.0f}% have PI>2 (Day 2016: ~60% of expressed)")
+          f"{pi_gt2:.0f}% have PI>2 (lit. envelope ~60-91%: Day 2016 ~60% of FPKM>=1 expressed, Rahl 2010 ~91% active)")
     # ACTIVE-subset medians (the all-gene medians hide the active population; report it separately so
     # initiation / RNAPII-per-gene / pause / pf can be read for the genes that actually drive output).
     dwA = pd.to_numeric(df["mean_pause_dwell_s"], errors="coerce")[m][expr].dropna()
@@ -341,11 +302,8 @@ _CLASS_OUTPUT_TARGET = {
 
 
 def class_breakdown(df: pd.DataFrame, gene_table: np.ndarray) -> "pd.DataFrame | None":
-    """Per regulatory-class transcription summary, keyed by the ``gene_class`` tag carried on the
-    H5 ``genes`` dataset (emitted by the config generator). Returns None for trajectories that
-    predate the tag. Reports, per class: gene count, % silent / % expressed (by occupancy),
-    median output (all + expressed), and median RNAPII occupancy, alongside the per-class
-    literature target."""
+    """Per regulatory-class transcription summary, keyed by the ``gene_class`` tag on the
+    H5 ``genes`` dataset; None for trajectories that predate the tag."""
     names = getattr(gene_table.dtype, "names", None) or ()
     if "gene_class" not in names:
         return None
@@ -632,9 +590,8 @@ def measure_transcription(
                     legs = lef[k].reshape(-1)
                     cohesin_sites = legs[(legs >= 0) & (legs < N)]
 
-                # Stall attribution (vectorised over the stalled RNAPIIs in this frame):
-                # a STALLED RNAPII stalls just upstream of its obstacle, so look one site
-                # ahead. Lesion takes priority over cohesin (matches the original elif).
+                # Stall attribution, vectorised over the stalled RNAPIIs in this frame.
+                # Lesion takes priority over cohesin (matches the original elif).
                 if any_stall:
                     stmask = stp == STATE_STALLED
                     g_st = gp[stmask]
@@ -853,8 +810,6 @@ def _aggregate(df: pd.DataFrame, *, n_alleles: int) -> dict:
     return agg
 
 
-# Each panel: (metric column, descriptive title, x-axis label) — the band/scale come
-# from HUMAN_RANGES so every panel shades the human range and is self-explaining.
 # (column, title, x-label, log-x, display-scale [None -> HUMAN_RANGES scale])
 _DIST_PANELS = [
     ("elongation_velocity_bp_s", "Elongation velocity\n(RNAPII speed along the gene)", "kb / min", False, None),
@@ -905,10 +860,9 @@ _OUTPUT_CUTOFFS = [(0.0, "all with output > 0", "#9bb8d3"),
 
 
 def _output_cutoffs_panel(ax, out) -> None:
-    """Panel (b): transcript-output distribution shown at several DETECTION THRESHOLDS. Each cutoff is a step
-    histogram (nested subsets) with a matching dashed median line, so the reader sees how the 'expressed median'
-    shifts as low-output basal/ultra-low genes are excluded -- the median is cutoff-dependent, not a single
-    number. (The hard-silent, output==0, genes are off-axis on the log scale and excluded from every subset.)"""
+    """Panel (b): transcript-output distribution as nested step histograms at several detection
+    thresholds, each with a dashed median, showing the 'expressed median' is cutoff-dependent.
+    (output==0 genes are off-axis on the log scale and excluded from every subset.)"""
     out = np.asarray(out, float)
     pos = out[np.isfinite(out) & (out > 0)]
     ax.set_xscale("log")
@@ -999,9 +953,7 @@ _GUARDED_METRICS = ["initiation_rate_per_min", "completion_rate_per_min", "synth
 
 
 def _mask_implausible(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with the guarded rate/ratio metrics NaN'd for events_implausible genes (UID double-counts
-    on degenerate/short-window alleles -> spurious thousands-per-hour outliers), so plots and the aggregate
-    ignore them. Old TSVs without the flag pass through unchanged."""
+    """Copy with the guarded metrics NaN'd for events_implausible genes; old TSVs pass through."""
     if "events_implausible" not in df.columns:
         return df
     bad = df["events_implausible"].to_numpy(dtype=bool)
@@ -1059,11 +1011,8 @@ def plot_transcription_distributions_pub(df: pd.DataFrame, out_path: Path, *, ti
 
 
 def plot_distributions(df: pd.DataFrame, out_path: Path, *, title: str) -> None:
-    """Publication figure: per-gene distributions of each transcription metric
-    (median marked in red), including transcript production and nascent-RNA synthesis,
-    an occupancy->output scatter (RNAPII density vs transcripts), where RNAPII spends its
-    time, and the activity (expression) distribution. Each panel is self-contained:
-    the title says what it is and the x-axis gives the unit."""
+    """4x3 per-gene distributions of each transcription metric (median in red), plus an
+    occupancy->output scatter, a state-time stacked bar, and the output/rank distributions."""
     fig, axes = plt.subplots(4, 3, figsize=(15.5, 17))
     for ax, (key, ttl, xl, logx, sc) in zip(axes.flat[:8], _DIST_PANELS):
         _dist_panel(ax, df.get(key), key, ttl, xl, logx, sc)
@@ -1164,10 +1113,8 @@ def _draw_boundaries(ax, boundaries, *, label=False, top=False, bp_per_site=1000
 def plot_genome_tracks(df: pd.DataFrame, out_path: Path, *, title: str,
                        boundaries=None, chain: int | None = None,
                        bp_per_site: int = 1000) -> None:
-    """Publication figure (genome-browser view): each transcription metric plotted
-    ALONG the genome coordinate -- one marker per gene at its TSS (alleles averaged) --
-    with TAD boundaries marked (red dashed). Shows WHERE active genes and metric
-    outliers sit relative to TADs."""
+    """Genome-browser view: each transcription metric plotted along the genome coordinate,
+    one marker per gene at its TSS (alleles averaged), with TAD boundaries marked (red dashed)."""
     g = df.copy()
     g["pos"] = pd.to_numeric(g["chain_relative_tss"], errors="coerce")
     agg = g.dropna(subset=["pos"]).groupby("pos").mean(numeric_only=True).reset_index().sort_values("pos")
