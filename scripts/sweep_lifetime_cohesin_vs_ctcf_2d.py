@@ -148,9 +148,26 @@ def cell_label(life_mult: float, ctcf_mult: float) -> str:
     return f"life{multiplier_label(life_mult)}_ctcf{multiplier_label(ctcf_mult)}"
 
 
-def axis_tick_labels(multipliers: list[float], base_value: float) -> list[str]:
-    """Tick label = multiplier plus the resulting absolute lifetime (steps)."""
-    return [f"{multiplier_label(m)}\n{max(1, int(round(base_value * m)))}" for m in multipliers]
+def _format_seconds(seconds: float) -> str:
+    """Compact second formatting: drop decimals once the value is large."""
+    if seconds >= 100:
+        return f"{seconds:.0f}s"
+    if seconds >= 10:
+        return f"{seconds:.1f}s"
+    return f"{seconds:.2f}s"
+
+
+def axis_tick_labels(multipliers: list[float], base_value: float, tick_seconds: float) -> list[str]:
+    """Tick label = multiplier plus the resulting absolute lifetime in seconds.
+
+    Seconds = (resolved baseline lifetime in steps) * multiplier * tick_seconds.
+    The step count uses the same ``max(1, round(...))`` the grid configs apply, so
+    the label reflects the lifetime actually simulated, not the unrounded product.
+    """
+    return [
+        f"{multiplier_label(m)}\n{_format_seconds(max(1, int(round(base_value * m))) * tick_seconds)}"
+        for m in multipliers
+    ]
 
 
 def plot_grid_heatmaps(
@@ -221,8 +238,8 @@ def plot_grid_heatmaps(
         ax.set_xticklabels(ctcf_ticks, fontsize=9)
         ax.set_yticks(range(n_life))
         ax.set_yticklabels(life_ticks, fontsize=9)
-        ax.set_xlabel("lifetime_ctcf (multiplier / steps)", fontsize=9)
-        ax.set_ylabel("cohesin lifetime (multiplier / steps)", fontsize=9)
+        ax.set_xlabel("lifetime_ctcf (multiplier / seconds)", fontsize=9)
+        ax.set_ylabel("cohesin lifetime (multiplier / seconds)", fontsize=9)
         ax.set_title(METRIC_LABELS[metric].replace("\n", " "), fontsize=10)
         ax.tick_params(axis="both", length=0)
         for spine in ax.spines.values():
@@ -408,8 +425,13 @@ def main() -> None:
     stats.to_csv(out_dir / "sweep_stats.tsv", sep="\t", index=False)
     pd.DataFrame(generated_config_rows).to_csv(out_dir / "generated_configs.tsv", sep="\t", index=False)
 
-    life_ticks = axis_tick_labels(life_mults, base_lifetimes["lifetime"])
-    ctcf_ticks = axis_tick_labels(ctcf_mults, base_lifetimes["lifetime_ctcf"])
+    tick_seconds = float(base_cfg["lef"].get("tick_seconds") or 0.0)
+    if tick_seconds <= 0:
+        raise SystemExit(
+            "config1 lef.tick_seconds is missing or non-positive; cannot label axes in seconds"
+        )
+    life_ticks = axis_tick_labels(life_mults, base_lifetimes["lifetime"], tick_seconds)
+    ctcf_ticks = axis_tick_labels(ctcf_mults, base_lifetimes["lifetime_ctcf"], tick_seconds)
 
     svg_path = out_dir / "lifetime_cohesin_vs_ctcf_heatmaps.svg"
     plot_grid_heatmaps(summary, cell_grid, life_ticks, ctcf_ticks, svg_path)
@@ -430,7 +452,7 @@ def main() -> None:
         "baseline_label": args.label1,
         "baseline_config": str(args.config1),
         "baseline_h5": str(args.h5_config1),
-        "tick_seconds": float(base_cfg["lef"].get("tick_seconds") or 0.0),
+        "tick_seconds": tick_seconds,
         "bp_per_site": int(base_cfg["lef"].get("bp_per_site", 1000)),
         "axes": {
             "y_cohesin_lifetime": {

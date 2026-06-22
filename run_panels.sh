@@ -11,9 +11,9 @@ warmup_steps=40000 ### Warmup for equilibration, prior to production (not record
 trajectory_length=160000 ### Production simulation (recorded)
 tickseconds=2 # Number of seconds per simulation tick. At 250bp sites, a free cohesin extrudes 2 sites/tick = 500bp/tick, so 2s/tick = 250bp/s extrusion speed.
 nreplicates=20 # Simulation replicates. All run on the same topology. e.g alleles.
-bstr_mult=4.0 # Boundary strength multiplier, increases the probability of LEF stalling at CTCF sites. One time control. It is not checked per simulation tick (resolution-independent).
+bstr_mult=3.25 # Boundary strength multiplier, increases the probability of LEF stalling at CTCF sites. One time control. It is not checked per simulation tick (resolution-independent).
 typea_prob=0.25 # Type A lesion probability, i.e. if a lesion spawns on a gene body, what ratio of those lesions are Type A.
-blockProb=0.99625 # Probability of Type A (during pre-repair + repair) and Type B (during repair) lesions blocking cohesin extrusion. Evaluated per tick. Per-tick prob => recomputed for 2s ticks: 1-(1-0.985)*(2/8), same physical ~0.0019/s bypass rate (~533s dwell) as 0.985 at 8s/tick.
+blockProb=0.99 # Probability of Type A (during pre-repair + repair) and Type B (during repair) lesions blocking cohesin extrusion. Evaluated per tick.
 prerecognition_seconds=2400 # a.k.a pre-repair seconds, per tick probabilistic. Average time for a lesion to be recognized (and thus start repair). Evaluated per tick. 2400s = 40 minutes average time to recognition.
 repair_seconds=360 # Per tick probabilistic. Average time for a lesion to be repaired (after recognition). Evaluated per tick. 360s = 6 minutes average time to repair.
 
@@ -73,33 +73,33 @@ uv run python scripts/sweep_rnapoff_boundary_strength_1d.py \
 #   --prerecognition-seconds ${prerecognition_seconds} \
 #   --jobs ${nproc}
 
-# # Block probability sweep (block probability vs lesion density)
-# # block_prob is a PER-TICK probability; range rescaled for 2s ticks (1-(1-p)/4) to
-# uv run python scripts/gen_lesion_grid_and_heatmaps.py \
-#   --config configs/config1_${suffix}.yaml \
-#   --h5 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
-#   --out-dir ${outFolder}/block_prob_grid_typea01_${suffix} \
-#   --p-step 0.00125 --p-lo 0.995 --p-hi 1.0 \
-#   --spacings 28 32 40 44 52 56 68 80 100 132 200 400 \
-#   --repair-seconds ${repair_seconds} \
-#   --prerecognition-seconds ${prerecognition_seconds} \
-#   --bstr-mult ${bstr_mult} \
-#   --type-a-prob ${typea_prob} \
-#   --jobs ${nproc}
+# Block probability sweep (block probability vs lesion density)
+# block_prob is a PER-TICK probability; range rescaled for 2s ticks (1-(1-p)/4) to
+uv run python scripts/gen_lesion_grid_and_heatmaps.py \
+  --config configs/config1_${suffix}.yaml \
+  --h5 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
+  --out-dir ${outFolder}/block_prob_grid_typea01_${suffix} \
+  --p-step 0.0025 --p-lo 0.980 --p-hi 1.0 \
+  --spacings 28 32 40 44 52 56 68 80 100 132 200 400 \
+  --repair-seconds ${repair_seconds} \
+  --prerecognition-seconds ${prerecognition_seconds} \
+  --bstr-mult ${bstr_mult} \
+  --type-a-prob ${typea_prob} \
+  --jobs ${nproc}
 
 # # recognition (pre-repair) and repair sweep in seconds (seconds vs lesion density)
-# uv run python scripts/gen_lesion_timing_grids.py \
-#   --config configs/config1_${suffix}.yaml \
-#   --h5 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
-#   --out-dir ${outFolder}/rec_rep_timing \
-#   --type-a-prob ${typea_prob} \
-#   --prerecog-lo 300 --prerecog-hi 7200 --prerecog-step 300 \
-#   --repair-fixed ${repair_seconds} \
-#   --repair-lo 100 --repair-hi 1000 --repair-step 50 \
-#   --prerecog-fixed ${prerecognition_seconds} \
-#   --spacings 28 32 40 44 52 56 68 80 100 132 200 400 \
-#   --bstr-mult ${bstr_mult} --block-prob ${blockProb} \
-#   --jobs ${nproc}
+uv run python scripts/gen_lesion_timing_grids.py \
+  --config configs/config1_${suffix}.yaml \
+  --h5 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
+  --out-dir ${outFolder}/rec_rep_timing \
+  --type-a-prob ${typea_prob} \
+  --prerecog-lo 300 --prerecog-hi 7200 --prerecog-step 300 \
+  --repair-fixed ${repair_seconds} \
+  --repair-lo 100 --repair-hi 1000 --repair-step 50 \
+  --prerecog-fixed ${prerecognition_seconds} \
+  --spacings 28 32 40 44 52 56 68 80 100 132 200 400 \
+  --bstr-mult ${bstr_mult} --block-prob ${blockProb} \
+  --jobs ${nproc}
 
 # #### Parameter sweeps --- END #####
 
@@ -112,26 +112,3 @@ uv run python scripts/sweep_rnapoff_boundary_strength_1d.py \
 #   --jobs ${nproc}
 
 # #### Free cohesin lifetime vs Cohesin stalled at CTCF sweep --- END #####
-
-# #### RNAPII-cohesin block prob vs Cohesin lifetime at CTCF sweep --- START #####
-# # block_prob is PER-TICK; range rescaled for 2s ticks (1-(1-p)/4) 
-# uv run python scripts/sweep_blockprob_vs_ctcf_lifetime_2d.py \
-#   --config1 configs/config1_${suffix}.yaml --h5-config1 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
-#   --out-dir ${outFolder}/results_blockprob_ctcf_grid \
-#   --block-prob-lo 0.975 --block-prob-hi 0.9875 --block-prob-step 0.00125 \
-#   --ctcf-lifetime-multipliers 0.125,0.25,0.5,1,2,4,6 \
-#   --seconds-per-step ${tickseconds} \
-#   --jobs ${nproc}
-
-# #### RNAPII-cohesin block prob vs Cohesin lifetime at CTCF sweep --- END #####
-
-# #### Cohesin separation (density) vs Cohesin lifetime at CTCF sweep --- START #####
-
-# uv run python scripts/sweep_separation_vs_ctcf_lifetime_2d.py \
-#   --config1 configs/config1_${suffix}.yaml --h5-config1 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
-#   --out-dir ${outFolder}/results_separation_ctcf_grid \
-#   --separation-multipliers 0.125,0.25,0.5,1,2,4,6 \
-#   --ctcf-lifetime-multipliers 0.125,0.25,0.5,1,2,4,6 \
-#   --jobs ${nproc}
-
-# #### Cohesin separation (density) vs Cohesin lifetime at CTCF sweep --- END #####

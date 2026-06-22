@@ -64,11 +64,14 @@ CTCF_LIFETIME_BOOST = 4
 
 # ====================== RNAPII transcription kinetics ====================
 # Expressed-gene loading rate /s, geo-mean anchor (load_prob = 1-exp(-this*tick)); sets the overall
-# transcription LEVEL. Output is loading-limited but bounded by two soft ceilings on the hottest genes:
-# gene-body density (<=~0.25 Pol/kb) and promoter pause-site clearance (~1/dwell). Real expression is
-# Zipf bottom-heavy, ~2 mRNA/h median (Schwanhausser 2011); ~0.006 is the practical ceiling before the
-# moderate pile re-forms. The active tail (LOAD_RATE_MAX) is unchanged.
-RNAP_LOAD_RATE = 0.005
+# transcription LEVEL among EXPRESSED genes (force-silenced genes emit load_prob 0, see LOAD_SILENT_FRAC).
+# Output is loading-limited but bounded by two soft ceilings on the hottest genes: gene-body density
+# (<=~0.25 Pol/kb) and promoter pause-site clearance (~1/dwell). Real expression is Zipf bottom-heavy.
+# 0.0025 centers the EXPRESSED bulk in the QUIET band (~0.5-2/h output) so most expressed genes are quiet and
+# only a minority moderate/active (genome-wide activity bins ~ silent 35 / quiet 45 / moderate 15 / active 5;
+# all-gene output median ~0.1-0.5/h, expressed ~0.5-2/h). The active tail rides LOAD_RATE_MAX + the short-dwell
+# occlusion ceiling (rank-relative), so lowering this geo-mean shifts the BULK down without flattening the tail.
+RNAP_LOAD_RATE = 0.001
 # Hard cap on a single gene's loading rate /s. With the pause-initiation limit enforced in the engine
 # (rnapii_promoter_occlusion; Gressel 2019, Bartman 2019), realized initiation is gated by pause-escape,
 # not this cap -- so it can stay open to let fast-pause (CDK9-like) genes reach the hot tail (up to HSPA1A
@@ -143,30 +146,42 @@ PAUSE_DWELL_ACTIVITY_NOISE = 0.2
 # the median pin, so it only trims the extreme tails.
 PAUSE_MIN_S = 2     # tick floor: let the hottest pauses collapse into the steric regime
 PAUSE_MAX_S = 90
-# ACTIVITY-COUPLED PRODUCTIVE FRACTION: reduce premature-termination rate (k_term) at the most active genes so
-# they terminate LESS prematurely -> higher productive_fraction (more loads reach the 3' end). Unlike the dwell
-# ramp (which scales k_release and k_term TOGETHER -- ratio-invariant, leaving pf untouched), this changes the
-# k_release/k_term RATIO, so it genuinely lifts the active-tail pf and helps the hottest genes EXCEED the
-# output plateau. Graded over rank PF_ACTIVITY_RANK_KNEE->1.0 (max reduction = this at rank 1; floored below
-# the knee so the bulk -- and the realism MEDIAN -- is unchanged, only the genuine high-output tail is lifted).
-# Targeting from rank 0.5 instead nudged the measured pf median to 0.267 (above the literature ~0.25); a 0.7
-# knee keeps the median ~0.24 while still lifting the top genes. Kept loose: pausing/premature-termination is
-# only weakly, non-monotonically tied to expression (Day 2016 Spearman ~0.18). 0 = pf is class-only (legacy).
-# Active genes terminate less prematurely: Gressel 2019; Erickson 2018. NB do NOT also jitter k_term (compounds).
-PF_ACTIVITY_COUPLING = 0.25
-PF_ACTIVITY_RANK_KNEE = 0.7   # rank above which the k_term reduction ramps in (genes below it untouched)
+# ACTIVITY-DEPENDENT PRODUCTIVE FRACTION (full-range gradient on the k_release/k_term RATIO): real pf is
+# activity-graded (quiet 0.1-0.25, moderate 0.2-0.4, active 0.4-0.8; Mukherjee & Guertin k_pre/k_rel~2.6 ->
+# ~1/4 productive for a typical gene, but high-output genes terminate less prematurely -- Gressel 2019,
+# Erickson 2018). The dwell ramp scales k_release and k_term TOGETHER (ratio-invariant -> pf untouched); this
+# changes the RATIO. k_term is reduced for ACTIVE genes (rank>0.5 -> pf up) with a convex extra drop over the
+# top decile, and (mildly) raised for QUIET genes (rank<0.5 -> pf down). Kept asymmetric and quiet-light:
+# quiet genes already sit ~0.18 (in band) and lowering their pf also lowers their OUTPUT (pushes them toward
+# silent), so the quiet gain is small -- the load level (RNAP_LOAD_RATE) does the bin shaping, this knob mainly
+# lifts the moderate/active tail. Deterministic in rank -> NO new rng draw. Keep the realism MEDIAN <= 0.30.
+# factor(rank<0.5)=exp(QUIET_GAIN*(0.5-rank)*2); factor(rank>=0.5)=exp(-ACTIVE_GAIN*(rank-0.5)*2);
+# then *= exp(-ACTIVE_TOPBOOST*clip((rank-0.9)/0.1,0,1)). NB do NOT also jitter k_term (compounds).
+PF_QUIET_GAIN = 0.2       # ln k_term boost at rank 0 (quiet -> slightly lower pf); kept small to not over-silence
+PF_ACTIVE_GAIN = 1.1      # ln k_term reduction at rank 1 before the top boost (active -> higher pf)
+PF_ACTIVE_TOPBOOST = 0.8  # extra convex ln k_term reduction over rank 0.9->1.0 (hottest genes -> pf ~0.5-0.7)
 
 # ============== Activity distribution (loading heterogeneity) ============
 # Per-gene loading is drawn from a POWER-LAW (Zipf): the real transcriptome is power-law -- most genes
 # lowly expressed, a thin heavy tail high (Furusawa & Kaneko 2003; top ~600 genes ~ half the mRNA). The
 # heavy tail pulls the GEOMETRIC MEAN up, so renormalising it to RNAP_LOAD_RATE leaves the mode (most
 # genes) far below -> a bottom-heavy 'low'-dominant output. Multiplier m ~ m^(-ALPHA) on [1, RANGE].
-LOAD_POWERLAW_ALPHA = 1.8     # steeper -> more bottom-heavy
+LOAD_POWERLAW_ALPHA = 2.4     # steeper -> more bottom-heavy (more QUIET, fewer moderate/active at fixed geo-mean)
 LOAD_POWERLAW_RANGE = 3000.0  # max/min multiplier (dynamic range)
 LOAD_LOGNORM_SIGMA = 1.3      # on/off gate for loading heterogeneity (>0 = on); spread set by power-law above
-# Per-class fraction of genes forced near-silent (cell-type/developmental off in this cell).
-SILENT_PROB = {"hk_const": 0.0, "hk_high": 0.0, "celltype": 0.35, "dev": 0.72}
-LOAD_SILENT_FRAC = 0.005       # silent genes load at this x the expressed anchor
+# Per-class fraction of genes forced NOT-DETECTED (cell-type/developmental off in this cell). This is the
+# force-silenced pool, split below into truly-off + ultra-low; sized so the NOT-DETECTED total (= detected
+# complement) lands ~30-40% genome-wide -> ~60-70% detected.
+SILENT_PROB = {"hk_const": 0.0, "hk_high": 0.0, "celltype": 0.32, "dev": 0.66}
+LOAD_SILENT_FRAC = 0.0         # DEPRECATED/unused (silent genes now split into hard-off + ultra-low, below).
+# THREE-CLASS not-detected structure (user spec): of ALL allele-instances ~15-25% TRULY OFF (load_prob 0, no
+# meaningful promoter loading -> output 0), ~10-20% ULTRA-LOW / below-detection (rare leakage ~0.001-0.05
+# completions/h/allele), ~60-70% DETECTED. SILENT_PROB (above) sets the force-silenced = not-detected pool;
+# SILENT_HARD_FRAC splits that pool into truly-off vs ultra-low; ultra-low genes draw a LOG-UNIFORM load_prob
+# over LOAD_ULTRALOW_RANGE (-> ~0.001-0.05/h output; sim-validated). Real expression is a continuum (Ramskold
+# 2009): a deep-off population + a basal-leakage tail + the detected lobe, not a single hard spike at 0.
+SILENT_HARD_FRAC = 0.5               # of force-silenced genes: fraction TRULY OFF (load 0); the rest are ultra-low
+LOAD_ULTRALOW_RANGE = (2e-6, 1e-4)   # load_prob (log-uniform) for ultra-low genes -> ~0.001-0.05 completions/h/allele
 LOAD_TADSIZE_EXPONENT = 0.2    # loading factor = (median_TAD_size / TAD_size)^this (small TADs more active)
 
 # ============== RNAPII <-> cohesin coupling (moving barrier) =============
@@ -819,24 +834,42 @@ def main():
         # Class-blind renorm to the geo-mean target, THEN an ABSOLUTE per-class multiplier so lifting
         # housekeeping does NOT sink cell-type/dev (cell-type stays ~target, housekeeping above it).
         loads = raw / geo * target * class_mult
-        loads[silent] = LOAD_SILENT_FRAC * target             # silent genes near-off (class-independent)
         # Hard-cap the loading tail at the gene-body density ceiling so genes saturate near the
-        # density ceiling instead of piling Pol II up in the body.
+        # density ceiling instead of piling Pol II up in the body. The 1e-4 LOWER clip is a
+        # body-density floor for EXPRESSED genes only; force-silenced genes are set to 0 AFTER the
+        # clip so the floor cannot lift them back to ~16 leaked inits over the run. _round_prob(.,5)
+        # then emits load_prob==0.0 exactly, the engine's `nb_random()>=0` gate never fires (no
+        # load), init_ct==0, and the metrics map that to NaN (auto-dropped from pf/PI). Silencing is
+        # deterministic in the precomputed `silent` mask -> no new rng draw, expressed ranks/loads
+        # (hence dwell/pf/elong couplings) byte-identical.
         loads = np.clip(loads, 1e-4, calibration["load_prob_max"])
-        rank = (np.argsort(np.argsort(loads)) + 0.5) / len(loads)       # activity rank in (0,1)
+        loads[silent] = 0.0                                   # placeholder; split into hard-off + ultra-low below
+        exprm = ~silent                                       # transcribing genes
+        # Activity rank computed over EXPRESSED genes ONLY (silent genes don't transcribe), so rank 0.5 == the
+        # MEDIAN EXPRESSED gene -- the pf gradient, dwell ramp, elong tilt and pre-init dwell all pivot correctly
+        # even when a large fraction (~35-40%) is force-silenced. (If silent genes were ranked too, they'd fill the
+        # bottom 40% of ranks and shove every expressed gene above rank 0.5, lifting all their pf -> median pf HIGH.)
+        # Silent genes get rank 0; their kinetics are emitted but never used (load_prob 0). Deterministic -> no rng draw.
+        rank = np.zeros(len(loads))
+        if exprm.any():
+            rank[exprm] = (np.argsort(np.argsort(loads[exprm])) + 0.5) / int(exprm.sum())
         ts = calibration["tick_seconds"]
         # Per-gene k_release (from the class prel draw) and per-class k_term (-> class productive_fraction:
         # hk terminate less -> more productive). Both continuous rates /s.
         k_rel = np.array([_ref_prob_to_rate(g["pause_release_prob"], ts) for g in genes])
         k_term = np.array([CLASS_PAUSE_TERM_RATE.get(c, RNAP_PAUSE_TERM_RATE) for c in cls])
-        # Activity-coupled premature-termination reduction (PF_ACTIVITY_COUPLING): lower k_term at high-rank
-        # genes so the active tail terminates less prematurely -> higher productive_fraction. This changes the
-        # k_rel/k_term RATIO (unlike the dwell ramp, which scales both equally), so it genuinely lifts the
-        # top-gene pf and lets the hottest genes exceed the output plateau. Graded over rank KNEE->1.0, floored
-        # below the knee so the bulk pf (and the realism median) is untouched. Deterministic in rank (no rng draw).
-        if PF_ACTIVITY_COUPLING > 0.0:
-            _kn = PF_ACTIVITY_RANK_KNEE
-            k_term = k_term * (1.0 - PF_ACTIVITY_COUPLING * np.clip((rank - _kn) / (1.0 - _kn), 0.0, 1.0))
+        # Full-range, activity-graded productive fraction (pivot at rank 0.5): RAISE k_term mildly for quiet
+        # genes (pf down) and LOWER it for active genes (pf up), with a convex extra reduction over the top
+        # decile so the hottest genes reach pf ~0.5-0.7. Changes the k_rel/k_term RATIO (unlike the dwell ramp),
+        # so it genuinely spreads pf with activity and lets the hottest genes exceed the output plateau.
+        # Deterministic in rank -> no rng draw; base=k_rel+k_term is recomputed and the dwell-median bisection
+        # re-pins the bulk dwell, so the pausing_index median is preserved.
+        if PF_QUIET_GAIN > 0.0 or PF_ACTIVE_GAIN > 0.0:
+            _pf_fac = np.where(rank < 0.5,
+                               np.exp(PF_QUIET_GAIN * (0.5 - rank) * 2.0),
+                               np.exp(-PF_ACTIVE_GAIN * (rank - 0.5) * 2.0))
+            _pf_fac = _pf_fac * np.exp(-PF_ACTIVE_TOPBOOST * np.clip((rank - 0.9) / 0.1, 0.0, 1.0))
+            k_term = k_term * _pf_fac
         base = k_rel + k_term                                            # un-scaled pause-exit rate /s
         # Activity-dependent single-Pol pause dwell: a log-linear ramp of the activity rank makes dwell
         # anti-correlated with activity (active -> shorter), plus per-gene scatter for a realistic trend.
@@ -856,7 +889,8 @@ def main():
         def _median_dwell(fv):
             sc = np.clip(dwell_mult * fv ** pin_weight,
                          1.0 / (PAUSE_MAX_S * base), 1.0 / (PAUSE_MIN_S * base))
-            return float(np.median(1.0 / (base * sc)))
+            d = 1.0 / (base * sc)
+            return float(np.median(d[exprm])) if exprm.any() else float(np.median(d))   # pin the EXPRESSED median
         lo_f, hi_f = 1e-3, 1e3
         for _ in range(50):
             mid = math.sqrt(lo_f * hi_f)
@@ -881,11 +915,23 @@ def main():
         # unchanged. This is the last rng draw in the post-pass (nothing downstream consumes the stream).
         if CLASS_LOAD_MULT_LOGSIGMA > 0.0:
             load_jit = np.exp(rng.normal(0.0, CLASS_LOAD_MULT_LOGSIGMA, len(genes)))
-            load_jit[silent] = 1.0                               # silent genes stay at their floor
+            load_jit[silent] = 1.0                               # silent genes don't take the expressed jitter
             loads = np.clip(loads * load_jit, 1e-4, calibration["load_prob_max"])
+        # THREE-CLASS not-detected structure: split the force-silenced pool into TRULY-OFF (load 0) and
+        # ULTRA-LOW (log-uniform basal leakage over LOAD_ULTRALOW_RANGE -> ~0.001-0.05/h output), instead of one
+        # hard spike at 0. These are the LAST rng draws; silent loads feed only the emit step (rank/dwell/pf
+        # exclude silent genes via exprm), so nothing upstream is perturbed.
+        if silent.any():
+            sidx = np.where(silent)[0]
+            hard = rng.random(sidx.size) < SILENT_HARD_FRAC
+            loads[sidx[hard]] = 0.0                                          # truly off (no meaningful loading)
+            n_ulo = int((~hard).sum())
+            if n_ulo:
+                lo_l, hi_l = LOAD_ULTRALOW_RANGE
+                loads[sidx[~hard]] = np.exp(rng.uniform(math.log(lo_l), math.log(hi_l), n_ulo))  # ultra-low leakage
         for g, lp, kr, kt, s, em, pid, c in zip(genes, loads, k_rel, k_term, scale, elong_mult,
                                                 pre_init_dwell, cls):
-            g["load_prob"] = _round_prob(float(lp), 5)
+            g["load_prob"] = _round_prob(float(lp), 6)   # 6 dp so ultra-low loads (down to ~2e-6) survive rounding
             g["initiation_prob"] = _round_prob(_rate_to_prob(1.0 / float(pid), ts), 4)
             g["pause_release_prob"] = _round_prob(_rate_to_prob(kr * s, ts), 4)
             g["pause_term_prob"] = _round_prob(_rate_to_prob(kt * s, ts), 4)

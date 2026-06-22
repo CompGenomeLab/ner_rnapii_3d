@@ -11,7 +11,7 @@ The trajectory exposes (see ner_rnapii_3d/engine/simulate.py):
 
   * ``rnapii_positions`` (T, R, 2) = [global_site, gene_id], -1 = absent.
   * ``rnapii_states``    (T, R)    = PRE-INITIATION/PAUSED/ELONGATING/TERMINATING/STALLED.
-  * ``rnapii_ids``       (T, R)    = stable per-Pol uid (survives column reshuffle
+  * ``rnapii_ids``       (T, R)    = stable per-RNAPII uid (survives column reshuffle
                                      on unload) -> reconstructs each polymerase's
                                      load -> unload life, the basis for completion
                                      counts, per-molecule velocity and dwell times.
@@ -22,19 +22,19 @@ Each recorded frame is one tick; ``tick_seconds`` (from the config) converts tic
 to seconds. Four metric families are computed per gene and as a locus aggregate:
 
   CORE RATES & DENSITY
-    initiation_rate_per_min    new Pol II loaded at the TSS / time (bursty input)
-    completion_rate_per_min    Pol II reaching the TES (= transcript production rate)
+    initiation_rate_per_min    new RNAPII loaded at the TSS / time (bursty input)
+    completion_rate_per_min    RNAPII reaching the TES (= transcript production rate)
     synthesis_rate_nt_per_s    sites transcribed / time (nascent RNA throughput)
-    pol2_occupancy             mean Pol II present per tick (ChIP analog, per allele; incl. the 3' window)
+    pol2_occupancy             mean RNAPII present per tick (ChIP analog, per allele; incl. the 3' window)
     pol2_density_per_kb        occupancy / gene length (kb)
-    nascent_signal             mean ELONGATING|STALLED Pol II per tick (engaged)
-    term_zone_occupancy        mean Pol II in the 3' termination window past the TES (per tick)
+    nascent_signal             mean ELONGATING|STALLED RNAPII per tick (engaged)
+    term_zone_occupancy        mean RNAPII in the 3' termination window past the TES (per tick)
     elongation_velocity_bp_s   sites advanced / elongating-tick (bp/s; excludes the 3' termination crawl)
 
   Position classes are window-aware: rel = (pos-TSS)*direction; rel<=pause_offset is the
   promoter/pause, pause_offset<rel<=gene_length is the gene body (sets the pausing-index
   denominator), and rel>gene_length is the 3' termination window (Schwalb 2016) -- the last
-  is excluded from gene-body density so the pausing index is not diluted by terminating Pol.
+  is excluded from gene-body density so the pausing index is not diluted by terminating RNAPII.
 
   PAUSING & STATE KINETICS
     pausing_index              (TSS..pause-site) / gene-body density (travelling ratio)
@@ -51,9 +51,9 @@ to seconds. Four metric families are computed per gene and as a locus aggregate:
                                immediately ahead (NaN if no ``positions`` dataset)
 
   TRANSCRIPTIONAL BURSTING
-    active_fraction            fraction of ticks the gene holds >=1 Pol II
+    active_fraction            fraction of ticks the gene holds >=1 RNAPII
     burst_rate_per_min         onsets of activity / time
-    mean_burst_size            new Pol II initiated per active burst
+    mean_burst_size            new RNAPII initiated per active burst
     mean_burst_duration_s      mean active-interval length (s)
     mean_interburst_s          mean silent-interval length (s)
 
@@ -62,7 +62,7 @@ Outputs (to ``--out-dir``, default alongside the H5):
   * ``transcription_metrics.tsv``        one row per gene + an ``ALL`` aggregate row.
   * ``transcription_metrics.svg``        per-gene panels (rates, density, pausing,
                                          state fractions, velocity, bursting).
-  * ``transcription_tracks.svg``         Pol II ChIP + nascent per-site tracks,
+  * ``transcription_tracks.svg``         RNAPII ChIP + nascent per-site tracks,
                                          folded across alleles onto one locus.
 """
 from __future__ import annotations
@@ -105,7 +105,7 @@ from ner_rnapii_3d.plugins.rnapii import (  # noqa: E402
     STATE_TERMINATING,
 )
 
-# Engaged Pol II carries a nascent transcript (productive or transiently
+# Engaged RNAPII carries a nascent transcript (productive or transiently
 # obstacle-stalled in the gene body); same convention as polii_chip_nascent_track.py.
 _ENGAGED = (STATE_ELONGATING, STATE_STALLED)
 _STATE_ORDER = [STATE_PRE_INITIATION, STATE_PAUSED, STATE_ELONGATING, STATE_STALLED, STATE_TERMINATING]
@@ -134,6 +134,13 @@ _INTERFERENCE_KEYS = ["stall_frac", "lesion_stall_frac", "cohesin_stall_frac"]
 # fraction panel and (2) compute the realism-table pf median over estimable genes only. ~10 keeps the binomial
 # 95% CI half-width on pf~0.24 under ~0.27. (Genes with NO initiation are already NaN, mathematically undefined.)
 PF_MIN_EVENTS = 10
+
+# Minimum mean RNAPII/gene (occupancy) below which the PAUSING INDEX is reported per-gene but NOT aggregated
+# into the realism median: a near-silent gene piles a little promoter signal over an essentially empty body, so
+# its travelling ratio (promoter/body density) is a structural artefact (body denominator ~ counting noise),
+# not biology. Matches the activity_report 'silent (<0.3)' occupancy cut, so 'expressed' is one definition
+# across the report. Day 2016: PI>2 ~ 60% of EXPRESSED genes (not all annotated genes).
+PI_MIN_OCCUPANCY = 0.3
 _BURST_KEYS = [
     "active_fraction", "burst_rate_per_min", "mean_burst_size",
     "mean_burst_duration_s", "mean_interburst_s",
@@ -151,15 +158,15 @@ HUMAN_RANGES: dict[str, dict] = {
         src="genome-wide in-vivo: 0.5-4 kb/min mESC mean ~2; median ~1.5 human; "
             "2-6 kb/min HeLa mode 3.5; cf. typical-gene 1.3-4.3"),
     "mean_pause_dwell_s": dict(
-        lo=5.0, hi=60.0, scale=1 / 60, unit="min", disp="~0.1-1 min (single-Pol)", soft=True,
-        src="single-Pol kinetic dwell 1/(k_release+k_term): ~42 s human live-cell residence "
+        lo=5.0, hi=60.0, scale=1 / 60, unit="min", disp="~0.1-1 min (single-RNAPII)", soft=True,
+        src="single-RNAPII kinetic dwell 1/(k_release+k_term): ~42 s human live-cell residence "
             "(Steurer 2018, high conf); mammalian PRO-seq models imply faster, sub-minute (~6-20 s, "
             "less certain). NOT the minutes-scale apparent pause."),
     "apparent_pause_duration_s": dict(
         lo=60.0, hi=900.0, scale=1 / 60, unit="min", disp="~1-15 min (occ/output)", soft=True,
-        src="apparent = pause occupancy / PRODUCTIVE initiation (NOT single-Pol dwell): human mRNA "
+        src="apparent = pause occupancy / PRODUCTIVE initiation (NOT single-RNAPII dwell): human mRNA "
             "median ~1 min (Gressel 2019); MOUSE 6.9 min (Jonkers 2014); >15 min for many genes "
-            "(Shao & Zeitlinger; Krebs). = single-Pol dwell / productive_fraction"),
+            "(Shao & Zeitlinger; Krebs). = single-RNAPII dwell / productive_fraction"),
     "mean_terminating_dwell_s": dict(
         lo=60.0, hi=480.0, scale=1 / 60, unit="min", disp="1-8 min", soft=True,
         src="DERIVED, not directly measured in seconds (medium confidence): HEK293 3' decel to "
@@ -169,28 +176,28 @@ HUMAN_RANGES: dict[str, dict] = {
         src="avg human gene ~24kb at ~1.7-3.8 kb/min -> ~7-15min "
             "elongation + pause + 3' dwell; direct total dwell 179-357s for short genes"),
     "pol2_occupancy": dict(
-        lo=0.3, hi=10.0, scale=1.0, unit="Pol/gene", disp="~0.5-1.5 typ, <=10 active", soft=True,
-        src="~1.1 elongating Pol/gene body; promoter occupancy <10%; "
+        lo=0.3, hi=10.0, scale=1.0, unit="RNAPII/gene", disp="~0.5-1.5 typ, <=10 active", soft=True,
+        src="~1.1 elongating RNAPII/gene body; promoter occupancy <10%; "
             "~2/gene derived from model rates (~0.7 elongating + 3'-stalled barrier)"),
     "pol2_density_per_kb": dict(
-        lo=0.005, hi=0.25, scale=1.0, unit="Pol/kb", disp="~0.005-0.25 Pol/kb", soft=True,
+        lo=0.005, hi=0.25, scale=1.0, unit="RNAPII/kb", disp="~0.005-0.25 RNAPII/kb", soft=True,
         src="derived (occupancy / gene length)"),
     "initiation_rate_per_min": dict(
         lo=0.005, hi=3.0, scale=60.0, unit="/h", disp="~0.3-180 /h (loading; bursty)", soft=True,
-        src="LOADING rate incl. ~75-80% abortive Pol -- NOT productive output (compare completion_rate). "
+        src="LOADING rate incl. ~75-80% abortive RNAPII -- NOT productive output (compare completion_rate). "
             "Human PRODUCTIVE initiation: median ~1/min mRNA, 0.3 lincRNA, 0.15 eRNA, up to ~87/min (HSPA1A) "
             "(Gressel/Cramer 2019 K562); loading runs ~1/productive_fraction higher. lo=0.005/min floor for least-active expressed genes"),
     "completion_rate_per_min": dict(
         lo=0.005, hi=1.5, scale=60.0, unit="/h", disp="~0.3-90 /h (productive)", soft=True,
-        src="PRODUCTIVE initiation = mRNA output (Pol reaching the 3' end): human median ~1/min mRNA, "
+        src="PRODUCTIVE initiation = mRNA output (RNAPII reaching the 3' end): human median ~1/min mRNA, "
             "0.3 lincRNA, 0.15 eRNA, up to ~87/min (Gressel/Cramer 2019 K562). The literature-anchored "
             "band (vs loading above); lo=0.005/min floor for least-active expressed genes"),
     "pausing_index": dict(
         lo=1.5, hi=20.0, scale=1.0, unit="", disp="~2-20 (TSS->pause)", soft=True,
-        src="travelling ratio = promoter-proximal (TSS..pause site) / gene-body Pol density; paused"),
+        src="travelling ratio = promoter-proximal (TSS..pause site) / gene-body RNAPII density; paused"),
     "productive_fraction": dict(
         lo=0.05, hi=0.30, scale=1.0, unit="", disp="~0.15-0.25 (premat. term.)", soft=False,
-        src="~75-80% of paused Pol II prematurely terminate -> ~0.20-0.25 productive "
+        src="~75-80% of paused RNAPII prematurely terminate -> ~0.20-0.25 productive "
             "(STL-seq Drosophila ~20%; Mukherjee & Guertin mammalian ~25%; cross-species, not direct human)"),
 }
 
@@ -202,6 +209,7 @@ def realism_report(df: pd.DataFrame) -> pd.DataFrame:
     reports the fraction of genes inside the band."""
     rows = []
     ev = pd.to_numeric(df["initiation_events"], errors="coerce") if "initiation_events" in df.columns else None
+    occ = pd.to_numeric(df["pol2_occupancy"], errors="coerce") if "pol2_occupancy" in df.columns else None
     for key, r in HUMAN_RANGES.items():
         if key in df.columns:
             s = pd.to_numeric(df[key], errors="coerce")
@@ -212,6 +220,11 @@ def realism_report(df: pd.DataFrame) -> pd.DataFrame:
         # genes where the ratio is actually estimable, not undersampling artefacts (guarded for old TSVs).
         if ev is not None and key == "productive_fraction":
             s = s.where(ev >= PF_MIN_EVENTS)
+        # Pausing index is a structural artefact for near-silent genes (promoter signal over an empty body) --
+        # aggregate it over EXPRESSED genes only (occ >= PI_MIN_OCCUPANCY), so the reported median/in-range is
+        # the travelling ratio of genes that actually transcribe (Day 2016 defines PI on expressed genes).
+        if occ is not None and key == "pausing_index":
+            s = s.where(occ >= PI_MIN_OCCUPANCY)
         s = s.dropna()
         if s.empty:
             continue
@@ -267,13 +280,31 @@ def activity_report(df: pd.DataFrame) -> dict:
     med_expr_prod = float(prod[expr].median()) if expr.any() else float("nan")
     med_expr_load = float(load[expr].median()) if expr.any() else float("nan")
     print("\n=== transcriptional ACTIVITY distribution (expression heavy-tail) ===")
-    print(f"  Pol-occupancy classes: silent(<0.3)={f(silent):.0f}%  quiet(0.3-1)={f(quiet):.0f}%  "
+    print(f"  RNAPII-occupancy classes: silent(<0.3)={f(silent):.0f}%  quiet(0.3-1)={f(quiet):.0f}%  "
           f"moderate(1-3)={f(mod):.0f}%  active(>3)={f(act):.0f}%")
     print(f"    (a QUIET majority + a small active tail -- log-normal / Zipf)")
     print(f"  activity spread (occupancy p95/p5) = {spread:.0f}x   "
           f"(~10-1000x; expression spans 3-4 orders genome-wide)")
     print(f"  expressed genes: loading median {med_expr_load:.2f}/min; PRODUCTIVE median "
           f"{med_expr_prod:.2f}/min; {in_prod_band:.0f}% PRODUCTIVE in 0.2-1.5/min band")
+    # OUTPUT-based activity bins (the genome-wide framing: transcripts/h, all genes) + the truly-silent
+    # ('not detected') fraction + the pausing index over EXPRESSED genes only.
+    out_h = prod * 60.0
+    ob = lambda lo, hi: 100.0 * float(((out_h >= lo) & (out_h < hi)).mean())
+    ev = pd.to_numeric(df["initiation_events"], errors="coerce")[m] if "initiation_events" in df.columns else None
+    no_init_pct = 100.0 * float((ev == 0).mean()) if ev is not None else float("nan")
+    pi = pd.to_numeric(df["pausing_index"], errors="coerce")[m]
+    pim = pi[occ >= PI_MIN_OCCUPANCY].dropna()
+    pi_med = float(pim.median()) if pim.size else float("nan")
+    pi_gt2 = 100.0 * float((pim > 2).mean()) if pim.size else float("nan")
+    silent_out, quiet_out = ob(0, 0.05), ob(0.05, 1.0)
+    mod_out, act_out = ob(1.0, 10.0), ob(10.0, 1e18)
+    print(f"  OUTPUT bins (transcripts/h): silent(<0.05)={silent_out:.0f}%  quiet(0.05-1)={quiet_out:.0f}%  "
+          f"moderate(1-10)={mod_out:.0f}%  active(>10)={act_out:.0f}%  (target ~35/45/15/5)")
+    print(f"  not-detected (output <0.05/h): {silent_out:.0f}%  of which deep-silent / no-initiation: "
+          f"{no_init_pct:.0f}%  (target ~30-40% not-detected; the rest is a graded basal/leaky tail)")
+    print(f"  pausing index over EXPRESSED (occ>={PI_MIN_OCCUPANCY:g}): median {pi_med:.1f}; "
+          f"{pi_gt2:.0f}% have PI>2 (Day 2016: ~60% of expressed)")
     quiet_maj = (f(silent) + f(quiet)) >= 30.0
     heavy_tail = (spread >= 10.0) if spread == spread else False
     verdict = ("OK (quiet majority + heavy tail)" if (quiet_maj and heavy_tail)
@@ -283,7 +314,10 @@ def activity_report(df: pd.DataFrame) -> dict:
     return {"silent_pct": f(silent), "quiet_pct": f(quiet), "moderate_pct": f(mod),
             "active_pct": f(act), "spread_p95_p5": spread,
             "expr_load_median_per_min": med_expr_load,
-            "expr_prod_median_per_min": med_expr_prod, "expr_in_prod_band_pct": in_prod_band}
+            "expr_prod_median_per_min": med_expr_prod, "expr_in_prod_band_pct": in_prod_band,
+            "out_silent_pct": silent_out, "out_quiet_pct": quiet_out, "out_moderate_pct": mod_out,
+            "out_active_pct": act_out, "no_init_pct": no_init_pct,
+            "expr_pausing_index_median": pi_med, "expr_pct_PI_gt2": pi_gt2}
 
 
 # Per-class productive-output references (Gressel/Cramer 2019 K562): housekeeping/active genes
@@ -301,7 +335,7 @@ def class_breakdown(df: pd.DataFrame, gene_table: np.ndarray) -> "pd.DataFrame |
     """Per regulatory-class transcription summary, keyed by the ``gene_class`` tag carried on the
     H5 ``genes`` dataset (emitted by the config generator). Returns None for trajectories that
     predate the tag. Reports, per class: gene count, % silent / % expressed (by occupancy),
-    median output (all + expressed), and median Pol II occupancy, alongside the per-class
+    median output (all + expressed), and median RNAPII occupancy, alongside the per-class
     literature target."""
     names = getattr(gene_table.dtype, "names", None) or ()
     if "gene_class" not in names:
@@ -423,9 +457,9 @@ def measure_transcription(
         previous_active = np.zeros(n_genes, dtype=bool)
         have_previous_frame = False
         state_ticks = np.zeros((n_genes, 5), dtype=np.int64)   # cols indexed by state code
-        tss_pause_ct = np.zeros(n_genes, dtype=np.int64)   # Pol in [TSS, pause site]: rel in [0, pause_offset]
-        body_ct = np.zeros(n_genes, dtype=np.int64)        # Pol in the gene body: pause_offset < rel <= glen
-        term_zone_ct = np.zeros(n_genes, dtype=np.int64)   # Pol in the 3' termination window: rel > glen (past the TES)
+        tss_pause_ct = np.zeros(n_genes, dtype=np.int64)   # RNAPII in [TSS, pause site]: rel in [0, pause_offset]
+        body_ct = np.zeros(n_genes, dtype=np.int64)        # RNAPII in the gene body: pause_offset < rel <= glen
+        term_zone_ct = np.zeros(n_genes, dtype=np.int64)   # RNAPII in the 3' termination window: rel > glen (past the TES)
         stall_total = np.zeros(n_genes, dtype=np.int64)
         stall_lesion = np.zeros(n_genes, dtype=np.int64)
         stall_cohesin = np.zeros(n_genes, dtype=np.int64)
@@ -434,7 +468,7 @@ def measure_transcription(
         # Per-molecule lifecycle state is needed only while a UID is live. UIDs
         # are stable and a polymerase appears in consecutive frames until unload,
         # so vanished UIDs can be reduced immediately instead of retaining five
-        # arrays containing every (frame, Pol) record for a global sort.
+        # arrays containing every (frame, RNAPII) record for a global sort.
         empty_i8 = np.empty(0, dtype=np.int64)
         live_uid = empty_i8
         live_gene = empty_i8
@@ -560,9 +594,9 @@ def measure_transcription(
                 state_ticks += np.bincount(gp * 5 + stp, minlength=n_genes * 5).reshape(n_genes, 5)
                 # pausing index from 1D position: rel = distance past TSS toward TES.
                 # The pause sits at rel == pause_offset; the body is pause_offset < rel <= glen.
-                # Pol with rel > glen are PAST the TES in the 3' termination window (they crawl
+                # RNAPII with rel > glen are PAST the TES in the 3' termination window (they crawl
                 # there before release) -- they must NOT count toward gene-body density, else the
-                # pausing index is diluted by the terminating Pol the window now lets exist.
+                # pausing index is diluted by the terminating RNAPII the window now lets exist.
                 rel = (sp - tss[gp]) * direction[gp]
                 glen_p = glen[gp]
                 tss_pause_ct += np.bincount(gp[rel <= pause_offset], minlength=n_genes)
@@ -573,7 +607,7 @@ def measure_transcription(
                 nascent_fold += np.bincount(sp[eng] % chain, minlength=chain)
 
                 # Co-transcriptional stall attribution: look one site ahead of each
-                # STALLED Pol (it stalls just upstream of the obstacle) and test those
+                # STALLED RNAPII (it stalls just upstream of the obstacle) and test those
                 # few sites against the active lesion/cohesin coordinates. This avoids
                 # allocating two N-wide boolean landscapes per stalled frame.
                 any_stall = bool((stp == STATE_STALLED).any())
@@ -589,8 +623,8 @@ def measure_transcription(
                     legs = lef[k].reshape(-1)
                     cohesin_sites = legs[(legs >= 0) & (legs < N)]
 
-                # Stall attribution (vectorised over the stalled Pols in this frame):
-                # a STALLED Pol stalls just upstream of its obstacle, so look one site
+                # Stall attribution (vectorised over the stalled RNAPIIs in this frame):
+                # a STALLED RNAPII stalls just upstream of its obstacle, so look one site
                 # ahead. Lesion takes priority over cohesin (matches the original elif).
                 if any_stall:
                     stmask = stp == STATE_STALLED
@@ -685,8 +719,8 @@ def measure_transcription(
     # vanished earlier were finalized as soon as they left the live UID set.
     finalize_lifecycles(np.ones(live_uid.size, dtype=bool))
 
-    # dwell means (nan where no contributing Pol); tick_seconds applied once so the
-    # result equals mean([count*tick_seconds, ...]) for the per-gene Pol set.
+    # dwell means (nan where no contributing RNAPII); tick_seconds applied once so the
+    # result equals mean([count*tick_seconds, ...]) for the per-gene RNAPII set.
     with np.errstate(invalid="ignore"):
         mean_pre = np.where(init_ct > 0, pre_n_sum / np.maximum(init_ct, 1) * tick_seconds, np.nan)
         mean_term = np.where(completed_ct > 0, term_n_sum / np.maximum(completed_ct, 1) * tick_seconds, np.nan)
@@ -718,8 +752,8 @@ def measure_transcription(
             "pol2_occupancy": occ,
             "pol2_density_per_kb": occ / max(glen[g] * kb_per_site, kb_per_site),
             "nascent_signal": nasc,
-            # mean Pol II in the 3' termination window (past the TES). The window lets a terminating
-            # Pol vacate the single TES slot, so the 3' end no longer jams; this is the 3' Pol
+            # mean RNAPII in the 3' termination window (past the TES). The window lets a terminating
+            # RNAPII vacate the single TES slot, so the 3' end no longer jams; this is the 3' RNAPII
             # accumulation that also reinforces the cohesin barrier downstream of the gene.
             "term_zone_occupancy": term_zone_ct[g] / T,
             "elongation_velocity_bp_s": (adv_sites[g] / elong_ticks[g] * bp_per_site / tick_seconds
@@ -728,13 +762,13 @@ def measure_transcription(
             # travelling ratio over the TSS->pause-site window.
             "pausing_index": ((tss_pause_ct[g] / prox_window) / body_d if body_d > 0 else float("nan")),
             "mean_pre_initiation_dwell_s": float(mean_pre[g]),
-            # single-Pol pause dwell: real time one Pol II stays paused before it
+            # single-RNAPII pause dwell: real time one RNAPII stays paused before it
             # releases OR terminates (1/(k_release+k_termination); ~0.4 min, short).
             "mean_pause_dwell_s": (pause_ticks[g] / pause_episodes[g] * tick_seconds
                                    if pause_episodes[g] > 0 else float("nan")),
             # apparent pause duration (occupancy/output): pause occupancy
             # divided by PRODUCTIVE initiation -- inflated ~1/productive_fraction-fold
-            # vs the single-Pol dwell because terminated Pol II are dropped from output.
+            # vs the single-RNAPII dwell because terminated RNAPII are dropped from output.
             "apparent_pause_duration_s": (state_ticks[g, STATE_PAUSED] * tick_seconds / completed_ct[g]
                                           if completed_ct[g] > 0 else float("nan")),
             "mean_terminating_dwell_s": float(mean_term[g]),
@@ -814,14 +848,14 @@ def _aggregate(df: pd.DataFrame, *, n_alleles: int) -> dict:
 # from HUMAN_RANGES so every panel shades the human range and is self-explaining.
 # (column, title, x-label, log-x, display-scale [None -> HUMAN_RANGES scale])
 _DIST_PANELS = [
-    ("elongation_velocity_bp_s", "Elongation velocity\n(Pol II speed along the gene)", "kb / min", False, None),
-    ("mean_pause_dwell_s", "Promoter-proximal pause\n(time Pol II pauses near the TSS)", "minutes", False, None),
-    ("mean_terminating_dwell_s", "3′ termination dwell\n(time Pol II spends at the gene 3′ end)", "minutes", False, None),
-    ("initiation_rate_per_min", "Initiation rate\n(new Pol II loaded)", "events / h", False, None),
-    ("pol2_occupancy", "Pol II per gene\n(occupancy ≈ Pol II ChIP)", "polymerases / gene", True, None),
+    ("elongation_velocity_bp_s", "Elongation velocity\n(RNAPII speed along the gene)", "kb / min", False, None),
+    ("mean_pause_dwell_s", "Promoter-proximal pause\n(time RNAPII pauses near the TSS)", "minutes", False, None),
+    ("mean_terminating_dwell_s", "3′ termination dwell\n(time RNAPII spends at the gene 3′ end)", "minutes", False, None),
+    ("initiation_rate_per_min", "Initiation rate\n(new RNAPII loaded)", "events / h", False, None),
+    ("pol2_occupancy", "RNAPII per gene\n(occupancy ≈ RNAPII ChIP)", "polymerases / gene", True, None),
     ("pausing_index", "Pausing index\n(promoter ÷ gene-body density)", "ratio", False, None),
-    ("completion_rate_per_min", "Transcript output\n(productive Pol II reaching the 3′ end)", "transcripts / h", False, 60.0),
-    ("synthesis_rate_nt_per_s", "Nascent RNA synthesis\n(engaged Pol II throughput ≈ GRO/PRO-seq)", "nt / s", True, 1.0),
+    ("completion_rate_per_min", "Transcript output\n(productive RNAPII reaching the 3′ end)", "transcripts / h", False, 60.0),
+    ("synthesis_rate_nt_per_s", "Nascent RNA synthesis\n(engaged RNAPII throughput ≈ GRO/PRO-seq)", "nt / s", True, 1.0),
 ]
 
 
@@ -851,6 +885,42 @@ def _dist_panel(ax, vals, key, title, xlabel, logx, scale=None):
     ax.set_xlabel(xlabel, fontsize=10)
     ax.set_ylabel("number of genes", fontsize=9.5)
     ax.tick_params(labelsize=9)
+
+
+# Detection thresholds (transcripts/h) for the panel-(b) overlay: the median "expressed output" depends
+# entirely on where the cutoff is drawn (the basal/ultra-low tail vs detected genes), so the panel shows the
+# output histogram at several cutoffs with each subset's median, instead of one threshold-dependent number.
+_OUTPUT_CUTOFFS = [(0.0, "all with output > 0", "#9bb8d3"),
+                   (0.05, "detected (> 0.05/h)", "#3b6b8a"),
+                   (1.0, "expressed (> 1/h)", "#A63446")]
+
+
+def _output_cutoffs_panel(ax, out) -> None:
+    """Panel (b): transcript-output distribution shown at several DETECTION THRESHOLDS. Each cutoff is a step
+    histogram (nested subsets) with a matching dashed median line, so the reader sees how the 'expressed median'
+    shifts as low-output basal/ultra-low genes are excluded -- the median is cutoff-dependent, not a single
+    number. (The hard-silent, output==0, genes are off-axis on the log scale and excluded from every subset.)"""
+    out = np.asarray(out, float)
+    pos = out[np.isfinite(out) & (out > 0)]
+    ax.set_xscale("log")
+    if pos.size:
+        bins = np.logspace(np.log10(max(pos.min(), 1e-4)), np.log10(pos.max()), 30)
+        ymax = 0.0
+        for c, lab, color in _OUTPUT_CUTOFFS:
+            v = pos[pos > c]
+            if not v.size:
+                continue
+            cnt, _, _ = ax.hist(v, bins=bins, histtype="step", color=color, lw=1.7, zorder=2,
+                                label=f"{lab}\nmed {np.median(v):.2g}/h (n={v.size})")
+            ymax = max(ymax, float(cnt.max()))
+            ax.axvline(np.median(v), color=color, lw=1.3, ls="--", alpha=0.85, zorder=3)
+        if ymax > 0:
+            ax.set_ylim(top=ymax * 1.18)  # small headroom; the upper-left legend sits over the short low-output bars
+        ax.legend(fontsize=6.3, frameon=False, loc="upper left", borderaxespad=0.3,
+                  handlelength=1.1, labelspacing=0.3)
+    ax.set_title("Transcript output\n(productive; by detection threshold)", fontsize=11.5, pad=5)
+    ax.set_xlabel("transcripts / h", fontsize=10)
+    ax.set_ylabel("number of genes", fontsize=9.5); ax.tick_params(labelsize=9)
 
 
 def _zipf_panel(ax, out) -> None:
@@ -894,31 +964,18 @@ def _pi_activity_panel(ax, df) -> None:
 
 
 def _pf_panel(ax, df) -> None:
-    """Productive-fraction panel that SEPARATES three populations instead of lumping every pf==0 into one bar:
-    (i) ESTIMABLE genes (>= PF_MIN_EVENTS initiations) -> the real histogram + median line, with the human band
-    shaded (the only genes pf is trustworthy for); (ii) LOW-COUNT genes (1..PF_MIN_EVENTS-1 inits) where a
-    pf==0 is undersampling, not biology; (iii) UNDEFINED genes (no initiation -> NaN). (ii) and (iii) are
-    tallied as a text annotation, NOT plotted as zeros, so the panel no longer shows a spurious spike at 0."""
+    """Productive-fraction histogram over ESTIMABLE genes only (>= PF_MIN_EVENTS initiations), so undersampled
+    pf==0 (few-event) and undefined (no-init) genes are excluded rather than piled at 0. Red line = median."""
     pf = pd.to_numeric(df.get("productive_fraction"), errors="coerce").to_numpy()
     ev = (pd.to_numeric(df.get("initiation_events"), errors="coerce").to_numpy()
           if "initiation_events" in df.columns else np.where(np.isfinite(pf), PF_MIN_EVENTS, 0))
-    est = np.isfinite(pf) & (ev >= PF_MIN_EVENTS)
-    lowc = np.isfinite(pf) & (ev > 0) & (ev < PF_MIN_EVENTS)
-    undef = ~np.isfinite(pf)
-    r = HUMAN_RANGES.get("productive_fraction", {})
-    if r:
-        ax.axvspan(r["lo"], r["hi"], color="#dfe7c8", alpha=0.6, zorder=0)   # shade the human band
-    v = pf[est]
+    v = pf[np.isfinite(pf) & (ev >= PF_MIN_EVENTS)]
     if v.size:
         ax.hist(v, bins=np.linspace(0, 1, 26), color="#6f8fbf", edgecolor="white", linewidth=0.3, zorder=2)
         med = float(np.median(v))
         ax.axvline(med, color="#A63446", lw=2.0, zorder=3)
         ax.annotate(f"median\n{med:.2g}", xy=(med, 0.97), xycoords=("data", "axes fraction"),
                     ha="right" if med > 0.5 else "left", va="top", fontsize=9, color="#A63446", fontweight="bold")
-    ax.annotate(f"estimable (≥{PF_MIN_EVENTS} inits): {int(est.sum())}\n"
-                f"low-count (1–{PF_MIN_EVENTS - 1}): {int(lowc.sum())}\n"
-                f"undefined (no init): {int(undef.sum())}",
-                xy=(0.96, 0.6), xycoords="axes fraction", ha="right", va="top", fontsize=8, color="#555")
     ax.set_title("Productive fraction\n(estimable genes only; ≥%d inits)" % PF_MIN_EVENTS, fontsize=11.5, pad=5)
     ax.set_xlabel("fraction", fontsize=10)
     ax.set_ylabel("number of genes", fontsize=9.5); ax.tick_params(labelsize=9)
@@ -953,14 +1010,14 @@ def _mask_implausible(df: pd.DataFrame) -> pd.DataFrame:
 # Publication figure: 9 curated panels (key transcription kinetics vs the human range) in a 3x3 grid.
 # (col, title, xlabel, logx, scale) -- scale None => HUMAN_RANGES display scale; each panel shades the band.
 _PUB_PANELS = [
-    ("initiation_rate_per_min", "Initiation (Pol II loaded,\nincl. abortive)", "events / h", True, 60.0),
-    ("completion_rate_per_min", "Transcript output\n(productive, reaching 3′)", "transcripts / h", True, 60.0),
+    ("initiation_rate_per_min", "Initiation (RNAPII loaded,\nincl. abortive)", "events / h", True, 60.0),
+    "OUTPUT_CUTOFFS",  # -> transcript output at several detection thresholds (median is cutoff-dependent)
     "ZIPF",  # -> rank-vs-output scatter
-    ("mean_pause_dwell_s", "Promoter-proximal pause\n(single-Pol dwell)", "minutes", True, None),
+    ("mean_pause_dwell_s", "Promoter-proximal pause\n(single-RNAPII dwell)", "minutes", True, None),
     "PI_ACTIVITY",  # -> pausing index vs activity (output) scatter
     ("elongation_velocity_bp_s", "Elongation velocity", "kb / min", False, None),
     "PF",  # -> productive-fraction panel separating undefined / low-count / estimable genes
-    ("pol2_occupancy", "Pol II per gene\n(occupancy ≈ ChIP)", "polymerases / gene", True, None),
+    ("pol2_occupancy", "RNAPII per gene\n(occupancy ≈ ChIP)", "polymerases / gene", True, None),
     ("mean_terminating_dwell_s", "3′ termination dwell", "minutes", False, None),
 ]
 
@@ -973,6 +1030,8 @@ def plot_transcription_distributions_pub(df: pd.DataFrame, out_path: Path, *, ti
     for i, (ax, spec) in enumerate(zip(axes.flat, _PUB_PANELS)):
         if spec == "ZIPF":
             _zipf_panel(ax, out)
+        elif spec == "OUTPUT_CUTOFFS":
+            _output_cutoffs_panel(ax, out)
         elif spec == "PI_ACTIVITY":
             _pi_activity_panel(ax, df)
         elif spec == "PF":
@@ -983,8 +1042,8 @@ def plot_transcription_distributions_pub(df: pd.DataFrame, out_path: Path, *, ti
         # panel letter (a, b, c, ...) matching the legend .txt, top-left outside the axes
         ax.text(-0.10, 1.07, f"{chr(97 + i)}", transform=ax.transAxes,
                 fontsize=15, fontweight="bold", va="top", ha="right")
-    fig.suptitle(title, fontsize=15, y=0.997)
-    fig.tight_layout(rect=(0, 0, 1, 0.97), h_pad=2.6, w_pad=1.8)
+    # no global title (publication figure; the caption lives in the legend .txt)
+    fig.tight_layout(h_pad=2.6, w_pad=1.8)
     fig.savefig(out_path, bbox_inches="tight")
     fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight")
     plt.close(fig)
@@ -993,25 +1052,25 @@ def plot_transcription_distributions_pub(df: pd.DataFrame, out_path: Path, *, ti
 def plot_distributions(df: pd.DataFrame, out_path: Path, *, title: str) -> None:
     """Publication figure: per-gene distributions of each transcription metric
     (median marked in red), including transcript production and nascent-RNA synthesis,
-    an occupancy->output scatter (Pol II density vs transcripts), where Pol II spends its
+    an occupancy->output scatter (RNAPII density vs transcripts), where RNAPII spends its
     time, and the activity (expression) distribution. Each panel is self-contained:
     the title says what it is and the x-axis gives the unit."""
     fig, axes = plt.subplots(4, 3, figsize=(15.5, 17))
     for ax, (key, ttl, xl, logx, sc) in zip(axes.flat[:8], _DIST_PANELS):
         _dist_panel(ax, df.get(key), key, ttl, xl, logx, sc)
 
-    # Panel 9: occupancy -> output (does Pol II density translate into transcripts, or saturate?).
+    # Panel 9: occupancy -> output (does RNAPII density translate into transcripts, or saturate?).
     ax = axes.flat[8]
     occ_s = pd.to_numeric(df.get("pol2_occupancy"), errors="coerce")
     out_s = pd.to_numeric(df.get("completion_rate_per_min"), errors="coerce") * 60.0
     m = np.isfinite(occ_s) & np.isfinite(out_s) & (occ_s > 0) & (out_s > 0)
     ax.scatter(occ_s[m], out_s[m], s=6, alpha=0.25, color="#3b6b8a", edgecolor="none", zorder=2)
     ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_title("Occupancy → output\n(does Pol II density yield transcripts?)", fontsize=11.5, pad=5)
-    ax.set_xlabel("Pol II per gene (occupancy)", fontsize=10)
+    ax.set_title("Occupancy → output\n(does RNAPII density yield transcripts?)", fontsize=11.5, pad=5)
+    ax.set_xlabel("RNAPII per gene (occupancy)", fontsize=10)
     ax.set_ylabel("transcripts / h", fontsize=9.5); ax.tick_params(labelsize=9)
 
-    # Panel 10: where Pol II spends its time (mean state-time fractions, one stacked bar).
+    # Panel 10: where RNAPII spends its time (mean state-time fractions, one stacked bar).
     ax = axes.flat[9]
     palette = [("pre_initiation", "#c9d6df"), ("paused", "#f2c14e"), ("elongating", "#3b8a5a"),
                ("stalled", "#A63446"), ("terminating", "#6b4e9e")]
@@ -1024,7 +1083,7 @@ def plot_distributions(df: pd.DataFrame, out_path: Path, *, title: str) -> None:
                     fontsize=8.5, color="white" if name != "pre_initiation" else "#333")
         left += frac
     ax.set_xlim(0, 1); ax.set_ylim(-0.6, 0.6); ax.set_yticks([])
-    ax.set_title("Where Pol II spends its time\n(mean fraction per state)", fontsize=11.5, pad=5)
+    ax.set_title("Where RNAPII spends its time\n(mean fraction per state)", fontsize=11.5, pad=5)
     ax.set_xlabel("fraction of polymerase-time", fontsize=10); ax.tick_params(labelsize=9)
 
     # Panel 11: transcript-OUTPUT distribution across genes -- a HISTOGRAM of gene counts vs productive output
@@ -1073,7 +1132,7 @@ def plot_distributions(df: pd.DataFrame, out_path: Path, *, title: str) -> None:
 # Heavy-tailed metrics (occupancy, pause, pausing index) use a LOG y-axis so a few
 # outliers don't squash the typical genes.
 _GENOME_TRACKS = [
-    ("pol2_occupancy", "Pol II / gene", "Pol", 1.0, "#465775", True),
+    ("pol2_occupancy", "RNAPII / gene", "RNAPII", 1.0, "#465775", True),
     ("initiation_rate_per_min", "initiation", "/min", 1.0, "#1b6ca8", False),
     ("elongation_velocity_bp_s", "elongation", "kb/min", 0.06, "#3b8a5a", False),
     ("mean_pause_dwell_s", "pause", "min", 1 / 60, "#c77d18", True),
@@ -1143,16 +1202,16 @@ def plot_genome_tracks(df: pd.DataFrame, out_path: Path, *, title: str,
 def plot_tracks(chip: np.ndarray, nascent: np.ndarray, genes: np.ndarray,
                 chain: int, out_path: Path, *, title: str, boundaries=None,
                 bp_per_site: int = 1000) -> None:
-    """Pol II ChIP (all present) and nascent (engaged) per-site tracks, folded
+    """RNAPII ChIP (all present) and nascent (engaged) per-site tracks, folded
     across alleles onto one locus; gene bodies shaded; TAD boundaries marked."""
     xs = np.arange(chain)
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(15, 7), sharex=True)
     a1.fill_between(xs, chip, color="#465775", lw=0)
-    a1.set_ylabel("Pol II per site\n(per allele)", fontsize=10.5)
-    a1.set_title("Pol II occupancy  —  all polymerases (ChIP-seq analog)", fontsize=12, loc="left")
+    a1.set_ylabel("RNAPII per site\n(per allele)", fontsize=10.5)
+    a1.set_title("RNAPII occupancy  —  all polymerases (ChIP-seq analog)", fontsize=12, loc="left")
     a2.fill_between(xs, nascent, color="#3b8a5a", lw=0)
     a2.set_ylabel("nascent RNA per site\n(per allele)", fontsize=10.5)
-    a2.set_title("Nascent RNA  —  engaged (elongating + stalled) Pol II (GRO/PRO-seq analog)",
+    a2.set_title("Nascent RNA  —  engaged (elongating + stalled) RNAPII (GRO/PRO-seq analog)",
                  fontsize=12, loc="left")
     for g in genes:
         lo, hi = sorted((int(g["tss"]) % chain, int(g["tes"]) % chain))
@@ -1167,7 +1226,7 @@ def plot_tracks(chip: np.ndarray, nascent: np.ndarray, genes: np.ndarray,
     for ax in (a1, a2):
         ax.tick_params(labelsize=9)
         ax.margins(x=0)
-    a1.annotate("grey = gene bodies · red dashed = TAD boundary · sharp 5′ peaks = promoter Pol II",
+    a1.annotate("grey = gene bodies · red dashed = TAD boundary · sharp 5′ peaks = promoter RNAPII",
                 xy=(0.5, 1.20), xycoords="axes fraction", ha="center", fontsize=9,
                 style="italic", color="#555")
     fig.suptitle(title, fontsize=14, y=0.99)
@@ -1282,28 +1341,29 @@ def main() -> None:
         pub_svg = out_dir / "transcription_distributions_pub.svg"
         plot_transcription_distributions_pub(
             dfp, pub_svg,
-            title=f"Per-gene transcription kinetics\n"
-                  f"n = {n} genes ({nloci} loci × {nall} alleles), {sub}")
+            title=f"Per-allele transcription kinetics\n"
+                  f"n = {n} allele-instances ({nloci} loci × {nall} replicate chains), {sub}")
         # publication figure legend (auto-filled with this run's n / loci / alleles)
         (out_dir / "transcription_distributions_pub_legend.txt").write_text(
-            "Figure. Per-gene transcription kinetics across the simulated gene population.\n"
-            f"Distributions over n = {n} genes ({nloci} genes in the modeled locus x {nall} "
-            "replicate chains, i.e. alleles). Red line, model median.\n"
-            "(a) Initiation rate (Pol II loading, including the ~75-80% that prematurely terminate "
-            "at the pause). (b) Productive transcript output (Pol II reaching the 3' end). (c) transcript output by "
+            "Figure. Per-allele transcription kinetics across the simulated allele-instance population.\n"
+            f"Distributions over n = {n} allele-instances = {nloci} loci (genes) in the modeled region x {nall} "
+            "replicate chains. Red line, model median.\n"
+            "(a) Initiation rate (RNAPII loading, including the ~75-80% that prematurely terminate "
+            "at the pause). (b) Productive transcript output (RNAPII reaching the 3' end), shown as nested step "
+            "histograms at several detection thresholds (output >0, >0.05/h, >1/h) each with its own dashed "
+            "median: the 'expressed median' is cutoff-dependent. (c) transcript output by "
             "gene rank: genes ranked by output (descending) on log-log axes. (d) Single-polymerase "
             "promoter-proximal pause dwell. (e) Pausing index vs gene activity: per-gene pausing "
-            "index (promoter-proximal / gene-body Pol II density) against productive output "
+            "index (promoter-proximal / gene-body RNAPII density) against productive output "
             "(transcripts/h), log-log, with the binned-median trend (red); highly expressed genes "
             "show a lower pausing index (traveling ratio). (f) Elongation velocity. (g) Productive "
             f"fraction (initiations reaching the 3' end), shown only for genes with >={PF_MIN_EVENTS} "
             "initiations (where the ratio is estimable); genes with fewer (low-confidence) or zero "
             "(undefined) initiations are tallied separately, not plotted as a spike at zero. "
-            "(h) Pol II occupancy per gene. (i) 3' termination dwell. Heavy-tailed metrics use a "
-            "logarithmic x-axis.\n")
+            "(h) RNAPII occupancy per gene. (i) 3' termination dwell.\n")
         track_svg = out_dir / "transcription_tracks.svg"
         plot_tracks(chip, nascent, genes, chain, track_svg,
-                    title=f"Pol II ChIP & nascent RNA tracks\n{sub}", boundaries=boundaries,
+                    title=f"RNAPII ChIP & nascent RNA tracks\n{sub}", boundaries=boundaries,
                     bp_per_site=bp_per_site)
         print(f"wrote {gene_svg}, {dist_svg}, {pub_svg} (+legend.txt), {track_svg}")
 
