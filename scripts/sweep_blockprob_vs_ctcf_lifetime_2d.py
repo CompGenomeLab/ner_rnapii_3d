@@ -552,7 +552,7 @@ def main() -> None:
                 all_metric_rows.append(result["frame"])
 
     per_chain = pd.concat(all_metric_rows, ignore_index=True)
-    summary, stats = summarize_sweep(per_chain, args.label1, grid_labels)
+    summary, stats = summarize_sweep(per_chain, args.label1, grid_labels, jobs=jobs)
 
     # Attach the two axis values to the per-cell summary/stats for clarity.
     for frame in (summary, stats):

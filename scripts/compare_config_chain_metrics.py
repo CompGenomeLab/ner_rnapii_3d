@@ -535,10 +535,14 @@ def analyze_run(
     def ratio(numerator: int | float, denominator: int | float) -> float:
         return numerator / denominator if denominator else float("nan")
 
+    span_index = np.arange(chain, dtype=np.int64)   # span value (sites) per histogram bin
     for chain_idx in range(num_chains):
         hist = span_hist[chain_idx]
         n_spans = int(hist.sum())
-        span_total = sum(i * int(value) for i, value in enumerate(hist) if value)
+        # sum(span_value * count) over the histogram, vectorised (was a Python loop
+        # over all `chain` bins per chain). Both sides are int64, so the dot product
+        # is the same integer total -- byte-identical, without the per-bin overhead.
+        span_total = int(span_index @ hist)
         mean_span = span_total / n_spans if n_spans else float("nan")
 
         gene_hits = int(counts["gene"][chain_idx])

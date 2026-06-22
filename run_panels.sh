@@ -11,7 +11,7 @@ warmup_steps=40000 ### Warmup for equilibration, prior to production (not record
 trajectory_length=160000 ### Production simulation (recorded)
 tickseconds=2 # Number of seconds per simulation tick. At 250bp sites, a free cohesin extrudes 2 sites/tick = 500bp/tick, so 2s/tick = 250bp/s extrusion speed.
 nreplicates=20 # Simulation replicates. All run on the same topology. e.g alleles.
-bstr_mult=3.25 # Boundary strength multiplier, increases the probability of LEF stalling at CTCF sites. One time control. It is not checked per simulation tick (resolution-independent).
+bstr_mult=4.0 # Boundary strength multiplier, increases the probability of LEF stalling at CTCF sites. One time control. It is not checked per simulation tick (resolution-independent).
 typea_prob=0.25 # Type A lesion probability, i.e. if a lesion spawns on a gene body, what ratio of those lesions are Type A.
 blockProb=0.99625 # Probability of Type A (during pre-repair + repair) and Type B (during repair) lesions blocking cohesin extrusion. Evaluated per tick. Per-tick prob => recomputed for 2s ticks: 1-(1-0.985)*(2/8), same physical ~0.0019/s bypass rate (~533s dwell) as 0.985 at 8s/tick.
 prerecognition_seconds=2400 # a.k.a pre-repair seconds, per tick probabilistic. Average time for a lesion to be recognized (and thus start repair). Evaluated per tick. 2400s = 40 minutes average time to recognition.
@@ -56,11 +56,11 @@ uv run python scripts/gen_cohesin_barrier_eval.py \
 uv run python scripts/sweep_rnapoff_boundary_strength_1d.py \
   --config1 configs/config1_${suffix}.yaml \
   --h5-config1 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
-  --multipliers 1,1.5,2,2.5,3,3.5,4,4.5,5 \
+  --multipliers 1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 \
   --out-dir ${outFolder}/boundary_sweep_${suffix} \
   --jobs $nproc
 
-# Type A probability sweep (TYPE A probability vs lesion density)
+# # Type A probability sweep (TYPE A probability vs lesion density)
 # uv run python scripts/gen_typea_density_grid.py \
 #   --config configs/config1_${suffix}.yaml \
 #   --h5 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
@@ -75,7 +75,6 @@ uv run python scripts/sweep_rnapoff_boundary_strength_1d.py \
 
 # # Block probability sweep (block probability vs lesion density)
 # # block_prob is a PER-TICK probability; range rescaled for 2s ticks (1-(1-p)/4) to
-# # explore the same physical lesion-dwell regime as the old 0.98-1.0 at 8s/tick.
 # uv run python scripts/gen_lesion_grid_and_heatmaps.py \
 #   --config configs/config1_${suffix}.yaml \
 #   --h5 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
@@ -115,8 +114,7 @@ uv run python scripts/sweep_rnapoff_boundary_strength_1d.py \
 # #### Free cohesin lifetime vs Cohesin stalled at CTCF sweep --- END #####
 
 # #### RNAPII-cohesin block prob vs Cohesin lifetime at CTCF sweep --- START #####
-# # block_prob is PER-TICK; range rescaled for 2s ticks (1-(1-p)/4) to hold the same
-# # physical block-dwell regime as the old 0.90-0.95 at 8s/tick.
+# # block_prob is PER-TICK; range rescaled for 2s ticks (1-(1-p)/4) 
 # uv run python scripts/sweep_blockprob_vs_ctcf_lifetime_2d.py \
 #   --config1 configs/config1_${suffix}.yaml --h5-config1 ${outFolder}/${suffix}_12/Baseline/LEFPositions.h5 \
 #   --out-dir ${outFolder}/results_blockprob_ctcf_grid \

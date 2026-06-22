@@ -32,8 +32,18 @@ def test_occlusion_off_kernel_matches_oracle(rnapii_cfg):
 
 
 def test_occlusion_suppresses_loading(rnapii_cfg):
-    on = kernel_record(_cfg(rnapii_cfg, True), WARMUP, TRAJ)
-    off = kernel_record(_cfg(rnapii_cfg, False), WARMUP, TRAJ)
+    # Crank loading high so the pause-initiation limit is the BINDING constraint. The invariant
+    # (occlusion can only reduce loading) is a property of the MECHANISM, not the loading level; at
+    # the production loading anchor (deliberately low, for a bottom-heavy Zipf output) only a few Pol
+    # load at this small test locus, so the live-Pol comparison is noise-dominated. High, unconditional
+    # loading makes the suppression unambiguous.
+    base = copy.deepcopy(rnapii_cfg)
+    base.topology_kwargs = dict(base.topology_kwargs)
+    base.topology_kwargs["genes"] = [dict(g, load_prob=0.5, requires_enhancer=False,
+                                          load_requires_enhancer=False)
+                                     for g in base.topology_kwargs["genes"]]
+    on = kernel_record(_cfg(base, True), WARMUP, TRAJ)
+    off = kernel_record(_cfg(base, False), WARMUP, TRAJ)
     live_on = (on["rp"][:, :, 0] >= 0).sum(1)
     live_off = (off["rp"][:, :, 0] >= 0).sum(1)
     # the pause-initiation limit can only reduce (never increase) loading

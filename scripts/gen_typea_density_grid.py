@@ -81,7 +81,22 @@ from gen_lesion_grid_and_heatmaps import (
     lesion_density_axis,
     measure_lesion_stall,
     plot_heatmaps,
+    run_and_measure_grid_point,
 )
+
+
+def _run_measure_typea(task: dict) -> dict:
+    """Worker: run/reuse one grid point's 1D H5, compute its fold means + measured
+    lesion-stall dict (shared worker), then add the measured Type-A-per-kb-of-gene-
+    body burden. Top-level + picklable so the whole run+analyze step parallelises
+    across the pool; deterministic per point -> byte-identical to the sequential
+    path. ``task`` carries ``gb_mask`` / ``bp_per_site`` for the extra readout."""
+    res = run_and_measure_grid_point(task)
+    if task.get("measure"):
+        res["typea"] = measure_typea_per_kb_genebody(
+            Path(res["h5"]), task["gb_mask"], bp_per_site=task["bp_per_site"],
+            chunk=task["measure_chunk"])
+    return res
 
 
 def ta_label(type_a: float, spacing: int) -> str:
@@ -341,6 +356,9 @@ def main() -> None:
     measured = {k: np.full(shape, np.nan) for k in _measured_keys()}
     measured[TYPEA_PERKB_KEY] = np.full(shape, np.nan)
 
+    # Each task carries the per-point analysis inputs (topo + measurement knobs,
+    # plus the gene-body mask for the Type-A-per-kb readout) so the worker can run
+    # the 1D stage AND measure in one process; the parent only accumulates.
     tasks = [
         {
             "ri": ri, "ci": ci, "ta": ta, "sp": sp,
@@ -348,6 +366,14 @@ def main() -> None:
             "cfg_path": str(grid_cfg_paths[(ta, sp)]),
             "h5_dir": str(h5_dir),
             "force_1d": args.force_1d,
+            "topo": topo,
+            "measure": not args.no_measure,
+            "tick_seconds": tick_seconds,
+            "measure_chunk": args.measure_chunk,
+            "prerec_ticks": prerec_ticks,
+            "repair_ticks": repair_t,
+            "gb_mask": gb_mask,
+            "bp_per_site": bp_per_site,
         }
         for ri, ta in enumerate(ta_sorted)
         for ci, sp in enumerate(sp_sorted)
@@ -355,41 +381,35 @@ def main() -> None:
     total = len(tasks)
     jobs = max(1, int(args.jobs))
 
-    def _record(task: dict, h5_path: str) -> None:
-        ri, ci, label = task["ri"], task["ci"], task["label"]
-        means = analyze_h5(label, Path(task["cfg_path"]), Path(h5_path), topo)
+    def _accumulate(result: dict) -> None:
+        ri, ci = result["ri"], result["ci"]
+        means = result["means"]
         for m in metrics_seen:
             gm = means.get(m, float("nan"))
             bm = baseline.get(m, float("nan"))
             raws[m][ri, ci] = gm
             folds[m][ri, ci] = gm / bm if np.isfinite(bm) and bm != 0 else float("nan")
         if not args.no_measure:
-            ms = measure_lesion_stall(
-                Path(h5_path), tick_seconds, chunk=args.measure_chunk,
-                prerecognition_ticks=prerec_ticks, repair_ticks=repair_t)
+            ms = result["ms"]
             for k in _measured_keys():
                 measured[k][ri, ci] = ms[k]
-            measured[TYPEA_PERKB_KEY][ri, ci] = measure_typea_per_kb_genebody(
-                Path(h5_path), gb_mask, bp_per_site=bp_per_site, chunk=args.measure_chunk)
+            measured[TYPEA_PERKB_KEY][ri, ci] = result["typea"]
 
     if jobs == 1:
         for n, task in enumerate(tasks, 1):
             print(f"[{n}/{total}] {task['label']}  "
                   f"(type_a={task['ta']:.3f}, density={density_axis[task['ci']]:.1f}/Mbp)")
-            res = _run_grid_point(task)
-            _record(task, res["h5"])
+            _accumulate(_run_measure_typea(task))
     else:
         print(f"running {total} grid points with --jobs {jobs} (process pool, fork context)")
         ctx = mp.get_context("fork")
-        by_label = {t["label"]: t for t in tasks}
-        n = 0
         with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
-            for res in ex.map(_run_grid_point, tasks):
-                n += 1
-                task = by_label[res["label"]]
-                print(f"[{n}/{total}] done {res['label']}  "
+            for n, (task, result) in enumerate(
+                zip(tasks, ex.map(_run_measure_typea, tasks)), 1
+            ):
+                print(f"[{n}/{total}] done {result['label']}  "
                       f"(type_a={task['ta']:.3f}, density={density_axis[task['ci']]:.1f}/Mbp)")
-                _record(task, res["h5"])
+                _accumulate(result)
 
     # 3) outputs ----------------------------------------------------------
     # Y axis labels the row's Type A probability only; the measured per-row

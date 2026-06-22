@@ -271,23 +271,61 @@ def selected_metric_rows(core_rows: list[dict], boundary_rows: list[dict]) -> pd
     return rows_to_metric_frame(rows, METRIC_ORDER)
 
 
+def _perm_pvalue_worker(payload: tuple) -> tuple:
+    """Worker: one independent permutation p-value (top-level + picklable).
+    ``_two_sample_permutation_pvalue`` reseeds ``default_rng(12345)`` per call, so
+    it is deterministic and order-independent -> pooled == sequential, byte-identical."""
+    key, base_values, comp_values = payload
+    return key, _two_sample_permutation_pvalue(base_values, comp_values)
+
+
+def _permutation_pvalues(arrays: dict, jobs: int) -> dict:
+    """Permutation p-value for every (label, metric) pair. Each is a fixed
+    200k-iteration Monte Carlo that dominates summarize_sweep, and they are mutually
+    independent and identically seeded, so with ``jobs > 1`` they run across a
+    process pool -- byte-identical to the sequential computation, just concurrent.
+    Pure-CPU work, so it scales with cores (unlike the I/O-bound H5 analysis)."""
+    if jobs <= 1:
+        return {key: _two_sample_permutation_pvalue(b, c) for key, (b, c) in arrays.items()}
+    ctx = mp.get_context("fork")
+    payloads = [(key, b, c) for key, (b, c) in arrays.items()]
+    out: dict = {}
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
+        for key, p in ex.map(_perm_pvalue_worker, payloads):
+            out[key] = p
+    return out
+
+
 def summarize_sweep(
     per_chain: pd.DataFrame,
     label1: str,
     sweep_labels: list[str],
+    jobs: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     baseline = per_chain[per_chain["config"] == label1]
     baseline_means = baseline.groupby("metric")["raw_value"].mean().to_dict()
     baseline_medians = baseline.groupby("metric")["raw_value"].median().to_dict()
 
+    # Extract each (label, metric) pair's baseline + comparison per-chain arrays once
+    # (identical values/order to the former in-loop extraction), then compute the
+    # permutation p-values -- the dominant cost -- in one (optionally parallel) batch.
+    base_by_metric = {
+        m: baseline[baseline["metric"] == m]["raw_value"].to_numpy(dtype=float)
+        for m in METRIC_ORDER
+    }
+    arrays: dict = {}
+    for label in sweep_labels:
+        sub = per_chain[per_chain["config"] == label]
+        for metric in METRIC_ORDER:
+            comp = sub[sub["metric"] == metric]["raw_value"].to_numpy(dtype=float)
+            arrays[(label, metric)] = (base_by_metric[metric], comp)
+    pvals = _permutation_pvalues(arrays, jobs)
+
     summary_rows = []
     stats_rows = []
     for label in sweep_labels:
         for metric in METRIC_ORDER:
-            base_values = baseline[baseline["metric"] == metric]["raw_value"].to_numpy(dtype=float)
-            comp_values = per_chain[
-                (per_chain["config"] == label) & (per_chain["metric"] == metric)
-            ]["raw_value"].to_numpy(dtype=float)
+            base_values, comp_values = arrays[(label, metric)]
             baseline_mean = float(np.nanmean(base_values)) if base_values.size else float("nan")
             comp_mean = float(np.nanmean(comp_values)) if comp_values.size else float("nan")
             fold = comp_mean / baseline_mean if baseline_mean else float("nan")
@@ -314,7 +352,7 @@ def summarize_sweep(
                 else float("nan")
             )
             fold_median_mad = comp_mad / baseline_median if baseline_median else float("nan")
-            p_value = _two_sample_permutation_pvalue(base_values, comp_values)
+            p_value = pvals[(label, metric)]
 
             summary_rows.append(
                 {
@@ -574,7 +612,7 @@ def main() -> None:
                 all_metric_rows.append(res["frame"])
 
     per_chain = pd.concat(all_metric_rows, ignore_index=True)
-    summary, stats = summarize_sweep(per_chain, args.label1, sweep_labels)
+    summary, stats = summarize_sweep(per_chain, args.label1, sweep_labels, jobs=jobs)
 
     per_chain.to_csv(out_dir / "sweep_per_chain_metrics.tsv", sep="\t", index=False)
     summary.to_csv(out_dir / "sweep_summary.tsv", sep="\t", index=False)

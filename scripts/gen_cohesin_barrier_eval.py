@@ -302,11 +302,11 @@ def plot_metagene(x_tss, x_tes, xs_scaled, on, off, flank, out_path, *, title, b
     fig.savefig(out_path, bbox_inches="tight"); fig.savefig(out_path.with_suffix(".png"), bbox_inches="tight"); plt.close(fig)
 
 
-def plot_activity(xs_scaled, active_prof, silent_prof, pol_occ, body_e, out_path, *,
+def plot_activity(xs_scaled, active_prof, silent_prof, pol_density, body_e, out_path, *,
                   title, pearson, spearman):
     """Publication figure: does cohesin accumulation scale with transcription?
     (Banigan: it should.) Left -- cohesin meta-gene for the most- vs least-transcribed
-    genes. Right -- per-gene cohesin enrichment vs Pol II occupancy."""
+    genes. Right -- per-gene cohesin enrichment vs Pol II density (polymerases per kb)."""
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5.2))
     a1.plot(xs_scaled, active_prof, color=_ON_C, lw=2.2, label="most-transcribed genes (top ⅓)")
     a1.plot(xs_scaled, silent_prof, color=_OFF_C, lw=2.0, label="least-transcribed genes (bottom ⅓)")
@@ -320,13 +320,13 @@ def plot_activity(xs_scaled, active_prof, silent_prof, pol_occ, body_e, out_path
     a1.set_xticks([0, 1]); a1.set_xticklabels(["TSS", "TES"], fontsize=10)
     a1.legend(fontsize=9.5, frameon=False)
 
-    m = np.isfinite(pol_occ) & np.isfinite(body_e)
-    a2.scatter(pol_occ[m], body_e[m], s=14, alpha=0.45, color="#3b3b6b", edgecolor="none")
+    m = np.isfinite(pol_density) & np.isfinite(body_e)
+    a2.scatter(pol_density[m], body_e[m], s=14, alpha=0.45, color="#3b3b6b", edgecolor="none")
     a2.axhline(1.0, color="#999", lw=0.9, ls="--")
     a2.set_xscale("log")
     a2.set_title(f"Cohesin vs transcription per gene\n(Spearman ρ = {spearman:.2f}, "
                  f"Pearson r = {pearson:.2f})", fontsize=12.5)
-    a2.set_xlabel("Pol II occupancy at the gene (polymerases, log scale)", fontsize=10.5)
+    a2.set_xlabel("Pol II density at the gene (polymerases per kb, log scale)", fontsize=10.5)
     a2.set_ylabel("gene-body cohesin enrichment\n(× genome average)", fontsize=10.5)
     a2.tick_params(labelsize=9.5)
     fig.suptitle(title, fontsize=14.5, y=1.0)
@@ -412,9 +412,17 @@ def main() -> None:
                             nbody=args.nbody, gene_mask=active_mask)
     _, sil_prof = _profiles(occ_on, genes, gm_on, N, chain, flank=args.flank,
                             nbody=args.nbody, gene_mask=silent_mask)
-    pear = float(np.corrcoef(np.log(pol_occ[finite & (pol_occ > 0)]),
-                             body_e[finite & (pol_occ > 0)])[0, 1])
-    spear = _spearman(pol_occ, body_e)
+    # Per-gene Pol II density (polymerases per kb): occupancy normalised by gene
+    # length. Cohesin body enrichment is itself a density (mean over the body), so
+    # this is the apples-to-apples transcription axis for the per-gene scatter and
+    # its correlation -- and it controls for the fact that longer genes hold more
+    # polymerases at the same elongation rate.
+    gene_len_kb = (np.abs(genes["tes"].astype(np.int64) - genes["tss"].astype(np.int64)) + 1) \
+        * (bp_per_site / 1000.0)
+    pol_density = pol_occ / gene_len_kb
+    dens_ok = np.isfinite(pol_density) & (pol_density > 0) & np.isfinite(body_e)
+    pear = float(np.corrcoef(np.log(pol_density[dens_ok]), body_e[dens_ok])[0, 1])
+    spear = _spearman(pol_density, body_e)
 
     # --- summary --------------------------------------------------------
     def _peak(p, lo, hi):
@@ -427,7 +435,7 @@ def main() -> None:
     print(f"  TES peak   ON={_peak(on_prof['tes'], fl-8, fl+3):.2f}"
           + (f"  OFF={_peak(off_prof['tes'], fl-8, fl+3):.2f}" if off_prof else ""))
     print(f"  body mean  active={np.nanmean(body_e[active_mask]):.2f}  silent={np.nanmean(body_e[silent_mask]):.2f}")
-    print(f"  cohesin-vs-activity  Pearson r={pear:.2f}  Spearman ρ={spear:.2f}")
+    print(f"  cohesin-vs-activity (Pol II per kb)  Pearson r={pear:.2f}  Spearman ρ={spear:.2f}")
     if off_prof is not None:
         # Isolated transcription effect: mean ON-OFF cohesin enrichment over the
         # gene body (TSS..TES). >0 = moving-barrier accumulation; <0 = net eviction.
@@ -442,7 +450,7 @@ def main() -> None:
                   out_dir / "cohesin_barrier_metagene.svg",
                   title=f"Cohesin accumulation around genes (Banigan moving-barrier)\n{sub}",
                   bp_per_site=bp_per_site)
-    plot_activity(xs, act_prof["scaled"], sil_prof["scaled"], pol_occ, body_e,
+    plot_activity(xs, act_prof["scaled"], sil_prof["scaled"], pol_density, body_e,
                   out_dir / "cohesin_barrier_activity.svg",
                   title=f"Cohesin accumulation scales with transcription\n{sub}",
                   pearson=pear, spearman=spear)

@@ -442,41 +442,65 @@ def measure_lesion_stall(
         chunk = min(max(1, int(chunk)), max(1, 2_000_000 // widest_row))
 
         stalled = lesions_tot = blocking_tot = 0
-        # Overall continuous stall (any blocking lesion).
-        runs: list[int] = []
+        # Overall continuous stall (any blocking lesion). Completed run lengths are
+        # collected as per-frame int arrays and concatenated once at the end, rather
+        # than appended element-by-element via ``int(x)`` -- same values in the same
+        # order (so every dwell statistic is byte-identical), without the per-event
+        # Python conversion that scales with frames x lesion density.
+        runs: list[np.ndarray] = []
         cur = np.zeros((n_lefs, 2), dtype=np.int64)
         from_zero = np.zeros((n_lefs, 2), dtype=bool)
         # Per-category segments (split when the blocking category changes).
-        cat_runs: dict[int, list[int]] = {c: [] for c in _CATEGORIES.values()}
+        cat_runs: dict[int, list[np.ndarray]] = {c: [] for c in _CATEGORIES.values()}
         cat_legframes: dict[int, int] = {c: 0 for c in _CATEGORIES.values()}
         cur_cat = np.zeros((n_lefs, 2), dtype=np.int8)
         cur_len = np.zeros((n_lefs, 2), dtype=np.int64)
         from_zero_cat = np.zeros((n_lefs, 2), dtype=bool)
         gf = 0
+        # Category lookup indexed by ``type*2 + state``: 0=(A,PRE) 1=(A,REPAIR)
+        # 2=(B,PRE) 3=(B,REPAIR). A-PRE blocks cohesin only when RNAPII is absent;
+        # B-PRE never blocks (matches lesions.lesion_stalls_cohesin). Precomputing
+        # this lets the whole read-block be categorised with one table lookup.
+        cat_lut = np.array(
+            [_CAT_A_PRE if not rnapii else 0, _CAT_A_REPAIR, 0, _CAT_B_REPAIR],
+            dtype=np.int8,
+        )
         for start in range(0, frames, chunk):
             end = min(start + chunk, frames)
             sites = ds_sites[start:end]
             states = ds_states[start:end]
             types = ds_types[start:end]
             pos = positions[start:end] if positions is not None else ds_pos[start:end]
-            for k in range(end - start):
-                s, st, ty = sites[k], states[k], types[k]
-                valid = (s >= 0) & (s < N)
-                s, st, ty = s[valid], st[valid], ty[valid]
-                lesions_tot += s.size
 
-                # Recorded lesions are site-sorted. Build parallel category codes
-                # and query only the two next-step sites of each LEF via binary
-                # search, rather than zero-filling an N-wide map every frame.
-                if s.size > 1 and np.any(s[1:] < s[:-1]):
+            # Blocking category per recorded lesion, computed for the WHOLE block at
+            # once instead of rebuilt inside the per-frame loop: a table lookup on
+            # (type*2 + state), with the -1 padding / out-of-range sites cleared.
+            # Byte-identical to the former per-frame boolean masks (same category
+            # codes), but it removes ~6 numpy calls + three pad-copies per frame.
+            # Recorded lesions are site-sorted with the live entries packed into the
+            # low columns and -1 padding in the tail, so the valid set of each frame
+            # is its leading ``row_nv[k]`` columns (sliced below, no per-frame mask).
+            valid_blk = (sites >= 0) & (sites < N)
+            code = types.astype(np.int16)
+            code *= 2
+            code += states
+            np.clip(code, 0, 3, out=code)
+            block_cat = cat_lut[code]
+            block_cat[~valid_blk] = 0
+            row_nv = valid_blk.sum(axis=1)
+            lesions_tot += int(valid_blk.sum())
+            blocking_tot += int((block_cat > 0).sum())
+
+            for k in range(end - start):
+                nv = int(row_nv[k])
+                s = sites[k, :nv]
+                site_categories = block_cat[k, :nv]
+                # Re-sort only if the site-sorted invariant is somehow violated, so
+                # the searchsorted leg queries below stay correct.
+                if nv > 1 and np.any(s[1:] < s[:-1]):
                     order = np.argsort(s, kind="stable")
-                    s, st, ty = s[order], st[order], ty[order]
-                site_categories = np.zeros(s.size, dtype=np.int8)
-                if not rnapii:
-                    site_categories[(ty == _LES_TYPE_A) & (st == _LES_STATE_PRE)] = _CAT_A_PRE
-                site_categories[(ty == _LES_TYPE_A) & (st == _LES_STATE_REPAIR)] = _CAT_A_REPAIR
-                site_categories[(ty == _LES_TYPE_B) & (st == _LES_STATE_REPAIR)] = _CAT_B_REPAIR
-                blocking_tot += int((site_categories > 0).sum())
+                    s = s[order]
+                    site_categories = site_categories[order]
 
                 left = pos[k, :, 0]
                 right = pos[k, :, 1]
@@ -500,7 +524,7 @@ def measure_lesion_stall(
                 ended = (~blocked) & (cur > 0)
                 keep = ended & (~from_zero)
                 if keep.any():
-                    runs.extend(int(x) for x in cur[keep])
+                    runs.append(cur[keep])
                 cur[ended] = 0
                 from_zero[ended] = False
                 cur[blocked] += 1
@@ -513,7 +537,7 @@ def measure_lesion_stall(
                 for c in _CATEGORIES.values():
                     sel = seg_ended & (cur_cat == c) & (~from_zero_cat)
                     if sel.any():
-                        cat_runs[c].extend(int(x) for x in cur_len[sel])
+                        cat_runs[c].append(cur_len[sel])
                 cur_len[cont] += 1
                 cur_len[seg_ended] = 0
                 cur_cat[seg_ended] = 0
@@ -526,7 +550,8 @@ def measure_lesion_stall(
                 gf += 1
 
         # open runs at trajectory end are right-censored -> dropped
-        dwell = np.asarray(runs, dtype=float) * float(tick_seconds)
+        runs_arr = np.concatenate(runs) if runs else np.empty(0, dtype=np.int64)
+        dwell = runs_arr.astype(float) * float(tick_seconds)
         out = {
             "stalled_legs_per_frame": stalled / frames,
             "lesions_per_frame": lesions_tot / frames,
@@ -541,7 +566,9 @@ def measure_lesion_stall(
             "stalled_legtick_fraction": stalled / max(frames * n_lefs * 2, 1),
         }
         for cat, code in _CATEGORIES.items():
-            out.update(_dwell_summary(cat_runs[code], tick_seconds, cat,
+            parts = cat_runs[code]
+            cat_arr = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+            out.update(_dwell_summary(cat_arr, tick_seconds, cat,
                                       cat_legframes[code], frames, n_lefs))
         _stage_frac(out, tick_seconds, prerecognition_ticks, repair_ticks)
         return out
@@ -564,6 +591,33 @@ def _run_grid_point(task: dict) -> dict:
         force_1d=task["force_1d"],
     )
     return {"ri": task["ri"], "ci": task["ci"], "label": task["label"], "h5": str(h5_path)}
+
+
+def _measure_grid_point(task: dict, h5_path: Path) -> dict:
+    """Compute one grid point's fold means + (optionally) the measured lesion-stall
+    dict from its trajectory. Split out from :func:`run_and_measure_grid_point` so
+    the per-point analysis is single-sourced. ``task`` carries the analysis inputs
+    (``topo`` and, when ``measure`` is set, ``tick_seconds`` / ``measure_chunk`` /
+    ``prerec_ticks`` / ``repair_ticks``). Returns raw per-point results; the parent
+    accumulates them into the grids (order-independent via ``ri``/``ci``), so the
+    output is byte-identical to computing them inline."""
+    means = analyze_h5(task["label"], Path(task["cfg_path"]), Path(h5_path), task["topo"])
+    ms = None
+    if task.get("measure"):
+        ms = measure_lesion_stall(
+            Path(h5_path), task["tick_seconds"], chunk=task["measure_chunk"],
+            prerecognition_ticks=task["prerec_ticks"], repair_ticks=task["repair_ticks"])
+    return {"ri": task["ri"], "ci": task["ci"], "label": task["label"],
+            "h5": str(h5_path), "means": means, "ms": ms}
+
+
+def run_and_measure_grid_point(task: dict) -> dict:
+    """Worker: run/reuse one grid point's 1D H5 AND compute its analysis in the
+    same process, so the (previously serial) measurement parallelises with the 1D
+    stage across the pool. Top-level + picklable. Deterministic and independent per
+    point -> byte-identical to the sequential run-then-measure path."""
+    res = _run_grid_point(task)
+    return _measure_grid_point(task, Path(res["h5"]))
 
 
 def plot_heatmaps(
@@ -937,6 +991,9 @@ def main() -> None:
     measured_keys += list(MEASURED_STAGEFRAC_LABELS)
     measured = {k: np.full(shape, np.nan) for k in measured_keys}
 
+    # Each task carries the per-point analysis inputs (topo + measurement knobs) so
+    # the worker can run the 1D stage AND measure in the same process; the parent
+    # only accumulates the returned dicts.
     tasks = [
         {
             "ri": ri, "ci": ci, "p": p, "sp": sp,
@@ -944,6 +1001,12 @@ def main() -> None:
             "cfg_path": str(grid_cfg_paths[(p, sp)]),
             "h5_dir": str(h5_dir),
             "force_1d": args.force_1d,
+            "topo": topo,
+            "measure": not args.no_measure,
+            "tick_seconds": tick_seconds,
+            "measure_chunk": args.measure_chunk,
+            "prerec_ticks": prerec_ticks,
+            "repair_ticks": repair_t,
         }
         for ri, p in enumerate(p_sorted)
         for ci, sp in enumerate(sp_sorted)
@@ -951,9 +1014,9 @@ def main() -> None:
     total = len(tasks)
     jobs = max(1, int(args.jobs))
 
-    def _record(task: dict, h5_path: str) -> None:
-        ri, ci, label = task["ri"], task["ci"], task["label"]
-        means = analyze_h5(label, Path(task["cfg_path"]), Path(h5_path), topo)
+    def _accumulate(result: dict) -> None:
+        ri, ci = result["ri"], result["ci"]
+        means = result["means"]
         for m in metrics_seen:
             gm = means.get(m, float("nan"))
             bm = baseline.get(m, float("nan"))
@@ -963,9 +1026,7 @@ def main() -> None:
             # heatmap masks that cell instead of drawing inf.
             folds[m][ri, ci] = gm / bm if np.isfinite(bm) and bm != 0 else float("nan")
         if not args.no_measure:
-            ms = measure_lesion_stall(
-                Path(h5_path), tick_seconds, chunk=args.measure_chunk,
-                prerecognition_ticks=prerec_ticks, repair_ticks=repair_t)
+            ms = result["ms"]
             for k in measured:
                 measured[k][ri, ci] = ms[k]
 
@@ -973,24 +1034,23 @@ def main() -> None:
         for n, task in enumerate(tasks, 1):
             print(f"[{n}/{total}] {task['label']}  "
                   f"(p={task['p']:.3f}, density={density_axis[task['ci']]:.1f}/Mbp)")
-            res = _run_grid_point(task)
-            _record(task, res["h5"])
+            _accumulate(run_and_measure_grid_point(task))
     else:
         # Process pool: each grid point is an independent process that re-seeds
-        # numpy from the config and writes its own H5 -> bitwise-identical to
-        # sequential, just concurrent. A fork context avoids re-importing this
-        # module (and matplotlib) in every worker.
+        # numpy from the config, writes its own H5, AND measures it -> results are
+        # bitwise-identical to sequential, just concurrent (1D stage + the formerly
+        # serial analysis now both parallelise). A fork context avoids re-importing
+        # this module (and matplotlib) in every worker. ``ex.map`` preserves order,
+        # so zipping with ``tasks`` recovers each point's axis values for logging.
         print(f"running {total} grid points with --jobs {jobs} (process pool, fork context)")
         ctx = mp.get_context("fork")
-        by_label = {t["label"]: t for t in tasks}
-        n = 0
         with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
-            for res in ex.map(_run_grid_point, tasks):
-                n += 1
-                task = by_label[res["label"]]
-                print(f"[{n}/{total}] done {res['label']}  "
+            for n, (task, result) in enumerate(
+                zip(tasks, ex.map(run_and_measure_grid_point, tasks)), 1
+            ):
+                print(f"[{n}/{total}] done {result['label']}  "
                       f"(p={task['p']:.3f}, density={density_axis[task['ci']]:.1f}/Mbp)")
-                _record(task, res["h5"])
+                _accumulate(result)
 
     # 4) outputs ----------------------------------------------------------
     plots_dir = out_dir

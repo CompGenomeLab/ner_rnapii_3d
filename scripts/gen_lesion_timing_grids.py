@@ -75,6 +75,7 @@ from gen_lesion_grid_and_heatmaps import (
     lesion_density_axis,
     measure_lesion_stall,
     plot_heatmaps,
+    run_and_measure_grid_point,
 )
 
 
@@ -179,6 +180,13 @@ def run_sweep(
     folds = {m: np.full(shape, np.nan) for m in metrics_seen}
     measured = {k: np.full(shape, np.nan) for k in _measured_keys()}
 
+    # Per-row stage windows: the swept axis is this row's tick value, its fixed
+    # companion is the constant. Baked into each task as prerec_ticks/repair_ticks
+    # so the shared worker measures with the right windows and the parent only
+    # accumulates the returned dicts.
+    def _windows(t: int) -> tuple[int, int]:
+        return (t, fixed_ticks) if swept == "prerecog" else (fixed_ticks, t)
+
     tasks = [
         {
             "ri": ri, "ci": ci, "t": t, "sp": sp,
@@ -186,30 +194,28 @@ def run_sweep(
             "cfg_path": str(grid_cfg_paths[(t, sp)]),
             "h5_dir": str(h5_dir),
             "force_1d": force_1d,
+            "topo": topo,
+            "measure": not no_measure,
+            "tick_seconds": tick_seconds,
+            "measure_chunk": measure_chunk,
+            "prerec_ticks": _windows(t)[0],
+            "repair_ticks": _windows(t)[1],
         }
         for ri, t in enumerate(y_ticks)
         for ci, sp in enumerate(sp_sorted)
     ]
     total = len(tasks)
 
-    def record(task: dict, h5_path: str) -> None:
-        ri, ci = task["ri"], task["ci"]
-        means = analyze_h5(task["label"], Path(task["cfg_path"]), Path(h5_path), topo)
+    def accumulate(result: dict) -> None:
+        ri, ci = result["ri"], result["ci"]
+        means = result["means"]
         for m in metrics_seen:
             gm = means.get(m, float("nan"))
             bm = baseline.get(m, float("nan"))
             raws[m][ri, ci] = gm
             folds[m][ri, ci] = gm / bm if np.isfinite(bm) and bm != 0 else float("nan")
         if not no_measure:
-            # Stage windows for the fraction metric: the swept axis is this row's
-            # tick value, its fixed companion is the constant.
-            if swept == "prerecog":
-                prt, rpt = task["t"], fixed_ticks
-            else:
-                prt, rpt = fixed_ticks, task["t"]
-            ms = measure_lesion_stall(
-                Path(h5_path), tick_seconds, chunk=measure_chunk,
-                prerecognition_ticks=prt, repair_ticks=rpt)
+            ms = result["ms"]
             for k in measured:
                 measured[k][ri, ci] = ms[k]
 
@@ -217,16 +223,16 @@ def run_sweep(
         for n, task in enumerate(tasks, 1):
             print(f"  [{n}/{total}] {task['label']}  "
                   f"({y_label}={task['t'] * tick_seconds:.0f}s, density={density_axis[task['ci']]:.1f}/Mbp)")
-            record(task, _run_grid_point(task)["h5"])
+            accumulate(run_and_measure_grid_point(task))
     else:
         print(f"  running {total} grid points with jobs={jobs} (process pool, fork)")
-        by_label = {t["label"]: t for t in tasks}
         with ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("fork")) as ex:
-            for n, res in enumerate(ex.map(_run_grid_point, tasks), 1):
-                task = by_label[res["label"]]
-                print(f"  [{n}/{total}] done {res['label']}  "
+            for n, (task, result) in enumerate(
+                zip(tasks, ex.map(run_and_measure_grid_point, tasks)), 1
+            ):
+                print(f"  [{n}/{total}] done {result['label']}  "
                       f"({y_label}={task['t'] * tick_seconds:.0f}s, density={density_axis[task['ci']]:.1f}/Mbp)")
-                record(task, res["h5"])
+                accumulate(result)
 
     # outputs (y-axis = realized seconds) ---------------------------------
     y_fmt = "{:.0f}"
