@@ -305,6 +305,15 @@ def activity_report(df: pd.DataFrame) -> dict:
           f"{no_init_pct:.0f}%  (target ~30-40% not-detected; the rest is a graded basal/leaky tail)")
     print(f"  pausing index over EXPRESSED (occ>={PI_MIN_OCCUPANCY:g}): median {pi_med:.1f}; "
           f"{pi_gt2:.0f}% have PI>2 (Day 2016: ~60% of expressed)")
+    # ACTIVE-subset medians (the all-gene medians hide the active population; report it separately so
+    # initiation / RNAPII-per-gene / pause / pf can be read for the genes that actually drive output).
+    dwA = pd.to_numeric(df["mean_pause_dwell_s"], errors="coerce")[m][expr].dropna()
+    pfA = pd.to_numeric(df["productive_fraction"], errors="coerce")[m][expr].dropna()
+    if expr.any():
+        print(f"  ACTIVE subset (occ>=1, {f(expr):.0f}% of genes): initiation {med_expr_load*60:.0f}/h, "
+              f"output {med_expr_prod*60:.1f}/h, RNAPII/gene {float(occ[expr].median()):.1f}, "
+              f"pause {float(dwA.median()) if dwA.size else float('nan'):.0f}s, "
+              f"pf {float(pfA.median()) if pfA.size else float('nan'):.2f}")
     quiet_maj = (f(silent) + f(quiet)) >= 30.0
     heavy_tail = (spread >= 10.0) if spread == spread else False
     verdict = ("OK (quiet majority + heavy tail)" if (quiet_maj and heavy_tail)

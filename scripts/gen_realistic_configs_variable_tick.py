@@ -64,14 +64,15 @@ CTCF_LIFETIME_BOOST = 4
 
 # ====================== RNAPII transcription kinetics ====================
 # Expressed-gene loading rate /s, geo-mean anchor (load_prob = 1-exp(-this*tick)); sets the overall
-# transcription LEVEL among EXPRESSED genes (force-silenced genes emit load_prob 0, see LOAD_SILENT_FRAC).
-# Output is loading-limited but bounded by two soft ceilings on the hottest genes: gene-body density
-# (<=~0.25 Pol/kb) and promoter pause-site clearance (~1/dwell). Real expression is Zipf bottom-heavy.
-# 0.0025 centers the EXPRESSED bulk in the QUIET band (~0.5-2/h output) so most expressed genes are quiet and
-# only a minority moderate/active (genome-wide activity bins ~ silent 35 / quiet 45 / moderate 15 / active 5;
-# all-gene output median ~0.1-0.5/h, expressed ~0.5-2/h). The active tail rides LOAD_RATE_MAX + the short-dwell
-# occlusion ceiling (rank-relative), so lowering this geo-mean shifts the BULK down without flattening the tail.
-RNAP_LOAD_RATE = 0.001
+# transcription LEVEL among EXPRESSED genes (force-silenced genes get a graded near-0 load, see SILENT_PROB /
+# LOAD_SILENT_BASAL_*). Output is loading-limited but bounded by two soft ceilings on the hottest genes:
+# gene-body density (<=~0.25 Pol/kb) and promoter pause-site clearance (~1/dwell). Real expression is Zipf
+# bottom-heavy. This is the level dial: 0.001 = healthy-tissue (detected median ~1/h, ~66% detected); 0.0013 =
+# a COMMON-GROUND level between healthy and cancer (detected median ~1.2-1.3/h, ~69% detected, more moderate/
+# active) -- more expressive than healthy without cancer-line hypertranscription. The active tail rides
+# LOAD_RATE_MAX + the short-dwell occlusion ceiling (rank-relative), so changing this geo-mean shifts the BULK
+# without flattening the tail. Raise toward 0.002+ for a fuller cancer line (detected median 1.5-1.8/h).
+RNAP_LOAD_RATE = 0.0013
 # Hard cap on a single gene's loading rate /s. With the pause-initiation limit enforced in the engine
 # (rnapii_promoter_occlusion; Gressel 2019, Bartman 2019), realized initiation is gated by pause-escape,
 # not this cap -- so it can stay open to let fast-pause (CDK9-like) genes reach the hot tail (up to HSPA1A
@@ -172,7 +173,7 @@ LOAD_LOGNORM_SIGMA = 1.3      # on/off gate for loading heterogeneity (>0 = on);
 # Per-class fraction of genes forced NOT-DETECTED (cell-type/developmental off in this cell). This is the
 # force-silenced pool, split below into truly-off + ultra-low; sized so the NOT-DETECTED total (= detected
 # complement) lands ~30-40% genome-wide -> ~60-70% detected.
-SILENT_PROB = {"hk_const": 0.0, "hk_high": 0.0, "celltype": 0.32, "dev": 0.66}
+SILENT_PROB = {"hk_const": 0.0, "hk_high": 0.0, "celltype": 0.27, "dev": 0.56}
 LOAD_SILENT_FRAC = 0.0         # DEPRECATED/unused (silent genes now split into hard-off + ultra-low, below).
 # THREE-CLASS not-detected structure (user spec): of ALL allele-instances ~15-25% TRULY OFF (load_prob 0, no
 # meaningful promoter loading -> output 0), ~10-20% ULTRA-LOW / below-detection (rare leakage ~0.001-0.05
@@ -873,10 +874,11 @@ def main():
         base = k_rel + k_term                                            # un-scaled pause-exit rate /s
         # Activity-dependent single-Pol pause dwell: a log-linear ramp of the activity rank makes dwell
         # anti-correlated with activity (active -> shorter), plus per-gene scatter for a realistic trend.
-        # A convex top-decile boost (PAUSE_DWELL_TOPTAIL_BOOST, over rank 0.9->1.0) stops the very top genes
-        # saturating at the linear ramp's ~3x ceiling, so they keep stretching toward PAUSE_MIN and the output
-        # tail spreads instead of plateauing. Deterministic in rank -> no new rng draw, composition unperturbed.
-        top_boost = np.exp(PAUSE_DWELL_TOPTAIL_BOOST * np.clip((rank - 0.9) / 0.1, 0.0, 1.0))
+        # A convex top-tail boost (PAUSE_DWELL_TOPTAIL_BOOST, over rank 0.8->1.0) stops the active genes
+        # saturating at the linear ramp's ~3x ceiling, so they keep stretching toward PAUSE_MIN (active-subset
+        # pause ~25 s, matching active/cancer genes 10-30 s) and the output tail spreads instead of plateauing.
+        # Deterministic in rank -> no new rng draw, composition unperturbed; the median pin holds the global median.
+        top_boost = np.exp(PAUSE_DWELL_TOPTAIL_BOOST * np.clip((rank - 0.8) / 0.2, 0.0, 1.0))
         dwell_mult = np.exp(PAUSE_DWELL_ACTIVITY_SPREAD * (rank - 0.5)
                             + PAUSE_DWELL_ACTIVITY_NOISE * rng.standard_normal(len(genes))) * top_boost  # >1 shorter
         # PIN THE MEDIAN, but only on the bulk so the active tail keeps its fast pause escape: apply the
