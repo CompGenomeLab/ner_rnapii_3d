@@ -9,10 +9,7 @@ YAML config it simulates, on a 1D lattice:
 - **DNA lesions** (gene-body occurrence, pre-recognition / repair kinetics, cohesin
   and RNAPII blocking),
 
-and writes the trajectory to `LEFPositions.h5`. The dynamics run on a Numba kernel
-with an embedded MT19937 port, so a given seed yields a **byte-identical** trajectory
-independent of numpy/numba versions; recording is streamed to HDF5 in memory-bounded
-blocks.
+and writes the trajectory to `LEFPositions.h5`.
 
 ## Install / run (uv)
 
@@ -76,8 +73,3 @@ with the reference functions kept as the equivalence oracle.
 ```bash
 uv run pytest
 ```
-
-A self-validating suite (no frozen golden hashes): the production Numba kernel is
-checked **tick-for-tick** against the Python reference across every regime, the
-MT19937 port against NumPy's legacy `RandomState`, plus chunking-invariance, config
-parsing, output shapes/determinism, and physical invariants.

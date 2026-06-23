@@ -14,7 +14,7 @@ p = 1-exp(-k*t). Values are human (or closest mammalian) in-vivo. Key anchors:
               realized rate is pause-escape-limited, not loading-limited (Gressel 2019).
   3' DWELL    ~3 min over a ~3.3 kb termination window (Schwalb 2016; Cortazar 2019).
   TADs        classical scale (mean ~833 kb); convergent-CTCF + cohesin mechanism (Rao 2014).
-  CTCF        per-encounter stall ~0.125 (Gabriele 2022); config3 strengthens it x2.5.
+  CTCF        per-encounter stall ~0.125 (Gabriele 2022).
   COHESIN     1/240 kb; residence ~22.5 min (Hansen 2017 ~22; Gabriele 2022 ~20);
               CTCF-stabilized x4 (Gabriele 2022, "stabilized fourfold").
   CLASSES     ~3800 housekeeping genes, ~20% (Eisenberg & Levanon 2013);
@@ -54,8 +54,8 @@ def bp2sites(bp: float) -> int:
 REFERENCE_TICK_SECONDS = 20.0        # authoring tick for the prob ranges
 REFERENCE_TRAJECTORY_LENGTH = 12096  # recorded LEF steps (rescaled by tick)
 REFERENCE_WARMUP_STEPS = 10000       # discarded warm-up ticks (rescaled)
-REFERENCE_MD_STEPS_PER_BLOCK = 5000  # 3D MD steps per recorded block (rescaled)
-RESTART_EVERY_BLOCKS = 5000          # polymer restart interval (traj snapped to a multiple)
+REFERENCE_MD_STEPS_PER_BLOCK = 5000  # 3D MD steps per recorded block (rescaled) (Legacy)
+RESTART_EVERY_BLOCKS = 5000          # polymer restart interval (traj snapped to a multiple) (Legacy)
 
 # ========================== Cohesin (loop extrusion) =====================
 # Mean cohesin residence /s (lifetime_ticks = this/tick); 22.5 min live-imaging base
