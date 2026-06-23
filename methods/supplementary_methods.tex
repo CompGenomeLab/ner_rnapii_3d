@@ -63,20 +63,23 @@ and nucleotide-excision repair}
 \section{Model overview, time steps and lattice setup}
 
 We modelled interphase chromatin as a one-dimensional lattice and simulated the
-stochastic dynamics of three agent species along it: cohesin loop-extrusion
-complexes, RNA polymerase II, and ultraviolet photolesions. Building on
-established stochastic lattice models of loop extrusion (Fudenberg et al., 2016;
-Banigan et al., 2020) and the polychrom simulation framework (Imakaev et al., 2019), the system advanced in discrete, fixed-length time steps; within each
-step we updated lesion states, then (when transcription was active) recruited and
-translocated polymerases, and finally translocated cohesin, under hard occupancy
-exclusion so that no two agents shared a site. State transitions (binding,
+stochastic dynamics of three factors: cohesin loop-extrusion complexes, RNA
+polymerase II (RNAPII), and ultraviolet photolesions. Building on established stochastic
+lattice models of loop extrusion (Fudenberg et al., 2016; Banigan et al., 2020)
+and the polychrom simulation framework (Imakaev et al., 2019), we advanced the
+system in discrete, fixed-length time steps. Within each step, we updated lesion
+states, then (when transcription was active) recruited and translocated
+polymerases, and finally translocated cohesin, under hard occupancy exclusion so
+that no two factors occupied the same lattice site. State transitions (binding,
 dissociation, stage changes, capture and release) were memoryless, each drawn as
-a per-step Bernoulli trial equivalent to a first-order (Poisson) process; we report
-each as a rate constant or its characteristic time. We did not simulate the
-three-dimensional polymer. The features that population contact maps and single-locus
-imaging are most sensitive to (the one-dimensional cohesin distribution, the spans of
-the loops it extrudes, and the sites where extrusion is impeded) are themselves
-one-dimensional, and can be sampled with far greater statistical depth this way.
+a per-step Bernoulli trial equivalent to first-order (Poisson) processes. We
+report each transition either as a rate constant or as its characteristic time.
+We did not simulate the three-dimensional polymer. The features to which
+population contact maps and single-locus imaging are most sensitive (the
+one-dimensional cohesin distribution, the lengths of the loops it extrudes, and
+the sites at which extrusion is impeded) are themselves one-dimensional and can
+therefore be sampled with far greater statistical depth in this framework. The
+simulation engine is available at \url{https://github.com/CompGenomeLab/ner_rnapii_3d}.
 
 Two identities fixed the physical scale. Each lattice site corresponded to 250~bp of
 DNA, and each time step corresponded to 2~s of real time. All velocities,
@@ -85,19 +88,14 @@ identities. Each memoryless transition fired with a per-step probability set by 
 mean waiting time $\tau$,
 %
 \begin{equation}
-p \;=\; \frac{\Delta t}{\tau} \;\approx\; 1 - e^{-\Delta t/\tau},
-\qquad \Delta t = 2\ \mathrm{s},\ \ \ell = 250\ \mathrm{bp},
+p \;=\; 1 - e^{-\Delta t/\tau} \;\approx\; \frac{\Delta t}{\tau},
+\qquad \Delta t = 2\ \mathrm{s},
 \end{equation}
 %
-so we report every such process by its characteristic time $\tau$ or equivalent
-rate $1/\tau$. Magnitudes are tick-independent biology: a process is authored as a
-rate or duration and converted to its per-step probability through Eq.~1, so the
-same physical kinetics are recovered at any chosen step size. Kinetic constants
-baked into the configuration use the exact form $1-e^{-\Delta t/\tau}$, while the
-geometric per-step transitions evaluated inside the engine (cohesin unbinding,
-lesion recognition and repair) use the equivalent linear form $\Delta t/\tau$
-(capped at one); the two agree to better than $0.1\%$ at the calibrated $\tau$. The
-calibrated quantities are collected in Table~1.
+Accordingly, each process is specified by a physical rate $1/\tau$ or duration $\tau$ and
+converted to a per-step probability through Eq.~1, so the modelled kinetics are
+independent of the chosen step size. The
+calibrated quantities are reported in Table~1.
 
 We simulated a 10-Mb locus (40{,}000 sites) instantiated as twenty independent
 replicate copies (200~Mb of lattice in total), equilibrated each replicate for
@@ -147,9 +145,9 @@ Productive output, 3$'$ (realised) & detected median $\approx$0.02~min$^{-1}$/al
 Elongation velocity & 2.1~kb\,min$^{-1}$ (0.035~kb\,s$^{-1}$); $\approx$1.9 realised & in-vivo 1.3--4.3~kb\,min$^{-1}$ (Guo \& Price, 2013); 0.5--4 genome-wide (Jonkers et al., 2014); $\approx$2 assumed by Zhao et al., 2023 \\
 3$'$ termination dwell & $\approx$1.8~min (realised) & derived (Fong et al., 2015; Cortazar et al., 2019) \\
 \addlinespace
-\multicolumn{3}{@{}l}{\textit{RNA Pol II -- cohesin}}\\
-Cohesin transit past engaged Pol II & $\approx$100~s ($k \approx 0.01$~s$^{-1}$) & Banigan et al., 2023 \\
-Cohesin transit past pre-initiation Pol II & $\approx$12~s ($\approx$8$\times$ more permeable) & --- \\
+\multicolumn{3}{@{}l}{\textit{RNAPII -- cohesin}}\\
+Cohesin transit past engaged RNAPII & $\approx$100~s ($k \approx 0.01$~s$^{-1}$) & Banigan et al., 2023 \\
+Cohesin transit past pre-initiation RNAPII & $\approx$12~s ($\approx$8$\times$ more permeable) & --- \\
 Subunit : elongation velocity ratio & $\approx$3.6 (loop $\approx$7) & Banigan et al., 2023 ($\ge$3--5) \\
 \addlinespace
 \multicolumn{3}{@{}l}{\textit{Lesions and repair}}\\
@@ -169,69 +167,65 @@ sampled along the locus and used to partition it into topologically associating
 domains (TADs) whose lengths were anticorrelated with local gene density: dense
 regions were tiled by shorter domains (target median $\approx$0.75~Mb) and sparse
 regions by longer ones (target median $\approx$1.25~Mb), with individual lengths
-drawn from a heavy-tailed distribution and bounded to $\approx$0.3--2.8~Mb,
+drawn from a heavy-tailed distribution (realized range 0.51--1.87~Mb across the 10 domains),
 bracketing the sub-megabase domain-size distribution of mammalian genomes (median
-$\approx$0.88~Mb in mouse ES cells; Dixon et al., 2012). We scaled domains above the characteristic single-loop reach so that the
-emergent observable was domain-level insulation rather than isolated loop
+$\approx$0.88~Mb in mouse ES cells; Dixon et al., 2012). We scaled domains above the characteristic single-loop reach such that the
+emergent observable reflected domain-level insulation rather than isolated loop
 corner-peaks.
 
-Each domain boundary was a permeable, oriented CTCF proxy with a per-encounter
-probability of arresting an incident cohesin subunit, equivalent to CTCF occupancy.
+Each domain boundary was modelled as a permeable, oriented CTCF barrier with a per-encounter
+probability of arresting an incident cohesin subunit.
 Boundaries were oriented convergently (the left boundary arrested left-travelling
-subunits and the right boundary right-travelling subunits), recapitulating the
+subunits and the right boundary, right-travelling subunits), recapitulating the
 inward CTCF-motif polarity required for stable looping. Arrest probabilities were
-modest (tens of percent) and were set higher at boundaries flanking shorter, denser,
+modest (calibrated per-encounter values of $\approx$0.09--0.15, raised severalfold in
+the insulation sweeps of Section~8) and were set higher at boundaries flanking shorter, denser,
 more transcriptionally active domains. Each boundary's strength was an equal-weight
 blend of two drivers, the transcriptional activity and the gene density of its
 flanking domains, each taken from the more extreme (more active, denser) of the two
 flanks, so that boundary strength fell with domain length and active, gene-dense
-domains were well insulated on both sides. The
-two ends of the locus were reflecting.
+domains were well insulated on both sides. Reflecting boundary conditions were imposed at both ends of the locus.
 
 We placed genes at a locus-average density of $\approx$12 per~Mb (122 genes across
 the 10-Mb locus), with the
 per-domain count following the same gene-density latent that set the domain
-partition (so shorter, denser domains were more gene-dense), and with lengths
-drawn from a log-normal distribution (median $\approx$23~kb) with a tail beyond
+partition (such that shorter, denser domains were more gene-dense), and with lengths
+drawn from a log-normal distribution (median $\approx$24~kb) with a tail beyond
 100~kb, matching the human gene-length distribution. Placement was non-overlapping
 and interior genes were assigned transcriptional polarity at random, yielding
 co-directional, convergent and divergent neighbours in their natural proportions.
 Genes belonged to four regulatory classes: constitutive housekeeping, highly
 expressed housekeeping, cell-type-specific (the plurality) and developmental,
 differing in basal output, in the fraction held silent, and in their dependence on
-a distal enhancer. Each domain carried a transcriptional propensity set primarily
-by its inverse length and blended with its gene density, and its gene-class
-composition was drawn from that propensity, so that shorter domains were seeded
-with more active classes and longer domains with more poised or silent ones, a
-compartment-like anticorrelation between domain length and output.
+a distal enhancer. Each domain carried a transcriptional propensity set primarily by its inverse length and secondarily by its gene density. Gene-class composition was sampled from this propensity, such that shorter domains were enriched for more active classes and longer domains for more poised or silent ones. This resulted in a compartment-like anticorrelation between domain length and transcriptional output.
 
-We reproduced the enrichment of housekeeping start sites at TAD boundaries
-(Dixon et al., 2012) as an emergent feature: roughly half of boundaries acquired a
-single promoter, displaced 3--25~kb into the domain interior and housekeeping in
-$\approx$70\% of cases, giving a realised start-site enrichment of $\approx$2-fold
-near boundaries and avoiding the spurious peak that fixed on-boundary placement
-would produce. Regulated-class genes were assigned one or more enhancers within the
-same domain at a log-normal promoter--enhancer separation (median $\approx$30~kb,
-tail $>$~500~kb), consistent with measured enhancer--promoter distance distributions, a
-minority of pairs spanning a boundary; productive transcription of these genes was
-made contingent on current enhancer--promoter co-containment within a cohesin loop
-(Section~4), reproducing cohesin-dependent enhancer--promoter communication,
-established for Mediator--cohesin looping (Kagey et al., 2010) and for the
-cohesin-dependence of enhancer-driven activation (Narita et al., 2025).
+We recapitulated the enrichment of housekeeping start sites at TAD boundaries
+(Dixon et al., 2012) as an emergent feature. Approximately half of boundaries were
+assigned a single promoter positioned 3--25~kb inside the domain interior, with
+$\approx$70\% designated as housekeeping promoters. This yielded an approximately
+twofold enrichment of transcription start sites near boundaries while avoiding the
+artificial peak that would have arisen from placing promoters directly at boundary
+positions. Regulated-class genes were assigned one or more enhancers, with
+promoter--enhancer distances drawn from a log-normal distribution (median
+$\approx$30~kb, tail extending beyond 500~kb), consistent with measured
+enhancer--promoter separation distributions, although a minority of pairs spanned a
+boundary. Productive transcription of these genes required the enhancer and promoter
+to be simultaneously contained within a cohesin loop (Section~4), thereby
+recapitulating the cohesin-dependent nature of enhancer--promoter communication
+observed for Mediator--cohesin looping (Kagey et al., 2010) and for enhancer-driven
+transcriptional activation (Narita et al., 2025).
 
 % =====================================================================
 \section{Loop extrusion}
 
 We modelled cohesin as a loop-extruding complex with two motor subunits that bridge
 the base of a chromatin loop (the stretch of lattice between the two subunits
-constituting the loop). A complex bound as a minimal loop occupying a pair of
-adjacent sites and then enlarged it by translocating its two subunits
-bidirectionally away from one another, each advancing one site per time step
+constituting the loop). A complex initially occupied a pair of adjacent sites and extruded a loop by translocating its two subunits bidirectionally away from one another, each advancing one site per time step 
 (symmetric, two-sided extrusion). As in related cohesin simulations (Gabriele et
 al., 2022; Banigan et al., 2020), complexes could not bypass one another and could
 not translocate beyond the terminal lattice sites. A subunit advanced only into a
 vacant site; a boundary, another cohesin, a polymerase or a lesion arrested that
-subunit while the contralateral subunit could continue, so the complex extruded
+subunit while the contralateral subunit could continue, such that the complex extruded
 asymmetrically when one side was blocked.
 
 With the 2~s time step, one-site-per-subunit translocation gives a subunit velocity
@@ -250,8 +244,8 @@ does not state an extrusion speed directly), yet below the
 $\approx$0.5--2~kb\,s$^{-1}$ measured in single-molecule assays (Kim et al., 2019, mean
 $\approx$0.5~kb\,s$^{-1}$; Davidson et al., 2019, up to $\approx$2.1~kb\,s$^{-1}$); it
 therefore lies between the in-vivo and in-vitro estimates. (Equivalently, our 2~s step is
-half the $\approx$4~s that the in-vivo rate would imply.) We adopted the faster rate so
-that each extruding subunit outpaced transcription elongation (2.1~kb\,min$^{-1}$;
+half the $\approx$4~s that the in-vivo rate would imply.) We adopted the faster rate such
+ that each extruding subunit outpaced transcription elongation (2.1~kb\,min$^{-1}$;
 Section~4) by $\approx$3.6-fold (and the loop as a whole by $\approx$7-fold), at or
 above the at-least-threefold-to-fivefold separation required to
 reproduce transcription's effect on contact maps (Banigan et al., 2023).
@@ -279,7 +273,7 @@ N_{\mathrm{LEF}} = \frac{L_{\mathrm{tot}}}{d}
 %
 with $L_{\mathrm{tot}}$ the total lattice length, $d$ the cohesin separation and
 $\tau_{\mathrm{res}}$ the free residence time. This product is an unobstructed upper
-bound; boundaries, collisions and polymerase encounters truncate loops, so the realised
+bound; as boundaries, collisions and polymerase encounters truncate loops, the realised
 mean loop length in the transcription-on simulations was $\approx$216~kb, within the
 $\approx$150--300~kb range. We recruited complexes uniformly at
 random, without preference for promoters or enhancers: uniform loading reproduces
@@ -291,67 +285,64 @@ A subunit reaching an oriented boundary was captured (arresting extrusion on
 that side) with the boundary's per-encounter probability, and otherwise passed
 through; boundaries therefore biased rather than absolutely blocked extrusion. A
 captured complex was stabilised against turnover, extending its residence
-$\approx$4-fold to $\approx$90~min, matching the $\approx$4-fold CTCF-dependent
-stabilisation of cohesin reported in vivo (Gabriele et al., 2022), CTCF and cohesin
-having distinct chromatin-residence dynamics (Hansen et al., 2017). Because
-boundaries were inward-facing, capture preferentially produced domain-spanning
-loops; the resulting loop number and size distribution are consistent with the
-$\approx$$10^{4}$ loops and 185~kb median contact-domain size reported genome-wide
-(Rao et al., 2014).
+$\approx$4-fold, to $\approx$90~min (four times the $\approx$22.5~min free residence), matching the $\approx$4-fold CTCF-dependent
+stabilisation of cohesin reported in vivo (Gabriele et al., 2022), and reflecting the distinct chromatin-residence dynamics of CTCF and cohesin (Hansen et al., 2017).
 
 % =====================================================================
 \section{Transcription}
 
 We represented transcription at single-molecule resolution as the life cycle of
-individual RNA polymerase II complexes, because the translocating polymerase, not a
+individual RNAPII complexes, because the translocating polymerase, not a
 scalar expression level, interacts sterically with cohesin. A polymerase was
 recruited stochastically at a promoter and entered an obligatory promoter-proximal
 pause one lattice site ($\approx$250~bp) downstream of the start site (the single-site
 lattice resolution, coarser than the physiological $\sim$30--60~bp pause position). A
 paused polymerase \emph{occluded} the promoter: while it occupied the promoter-proximal
-window it suppressed the loading of a new polymerase, so gene throughput was limited by
+window, it suppressed the loading of a new polymerase; thus gene throughput was limited by
 the rate of pause escape rather than by recruitment --- the pause--initiation limit
-(Gressel et al., 2019). We therefore set output through pause-escape kinetics; raising
-the recruitment rate alone only deepened promoter-proximal occupancy without raising
-productive output.
+(Gressel et al., 2019). We therefore controlled output through pause-escape kinetics; increasing the recruitment rate alone only increased promoter-proximal occupancy without raising productive output.
 
 \begin{figure}[tp]
 \centering
 \includegraphics[width=\linewidth]{transcription_distributions_pub.pdf}
 \caption{\textbf{Per-allele transcription kinetics across the simulated
-allele-instance population.} Distributions over $n=2{,}440$ allele-instances $=$ 122
-loci (genes) in the modeled region $\times$ 20 replicate chains; red line, model
-median. \textbf{(a)}~Initiation rate (RNAPII loading, including the $\sim$70--80\% that
-prematurely terminate at the pause). \textbf{(b)}~Productive transcript output (RNAPII
-reaching the 3$'$ end), as nested step histograms at several detection thresholds
-(output $>$0, $>$0.05~h$^{-1}$, $>$1~h$^{-1}$), each with its own dashed median, so the
-``expressed median'' is cutoff-dependent. \textbf{(c)}~Transcript output by gene rank
-(log--log). \textbf{(d)}~Single-polymerase promoter-proximal pause dwell.
-\textbf{(e)}~Pausing index versus productive output (log--log) with the binned-median
-trend (red); highly expressed genes show a lower pausing index. \textbf{(f)}~Elongation
-velocity. \textbf{(g)}~Productive fraction, shown only for genes with $\ge$10
-initiations (where the ratio is estimable); genes with fewer (low-confidence) or zero
-(undefined) initiations are tallied separately, not plotted as a spike at zero.
-\textbf{(h)}~RNAPII occupancy per gene. \textbf{(i)}~3$'$ termination dwell.
-Heavy-tailed metrics use a logarithmic axis.}
+allele population.} Distributions were calculated from 2{,}440 allele-instances
+(122 loci (genes) across 20 replicate chains). Red lines indicate model medians.
+\textbf{(a)}~Initiation rate, defined as RNAPII loading events, including the
+70--80\% of polymerases that terminate prematurely during promoter-proximal pausing.
+\textbf{(b)}~Productive transcript output, defined as RNAPII molecules reaching the
+3$'$ ends of genes. Nested step histograms are shown for several detection thresholds
+(output $>$0, $>$0.05~h$^{-1}$, $>$1~h$^{-1}$), each with its own dashed median, such
+that the ``expressed median'' is cutoff-dependent. \textbf{(c)}~Productive transcript
+output by gene rank (log--log scale). \textbf{(d)}~Promoter-proximal pause dwell time
+of individual polymerases. \textbf{(e)}~Pausing index versus productive transcript
+output (log--log scale). The red line shows the binned-median trend. Highly expressed
+genes show lower pausing indices. \textbf{(f)}~Elongation velocity.
+\textbf{(g)}~Productive fraction, shown only for genes with at least 10 initiation
+events, for which the ratio can be estimated reliably. Genes with fewer than 10
+initiations (low-confidence) or no initiations (undefined ratio) are tallied
+separately and excluded from the distribution. \textbf{(h)}~RNAPII occupancy per gene.
+\textbf{(i)}~3$'$ termination dwell time. Heavy-tailed distributions are displayed on
+logarithmic axes.}
 \label{fig:txn}
 \end{figure}
 
 A paused polymerase resolved in one of two competing ways: it either escaped into
-productive elongation or terminated prematurely and was lost. The fraction that escaped
---- the productive fraction --- was a per-gene quantity set near the $\approx$0.2
-inferred for mammalian promoters, where roughly 80\% of promoter-proximally paused
-Pol~II terminate prematurely (Zimmer et al., 2021, by single-molecule STL-seq in human
-and \emph{Drosophila} cells; consistent with the rapid turnover of promoter-paused
-Pol~II seen by live imaging, Steurer et al., 2018). We made the productive fraction
-increase with activity --- lowest at quiet genes ($\approx$0.14) and highest at the
-most active genes ($\approx$0.47), reflecting the reduced premature termination of
-strongly transcribed promoters --- giving a population median of $\approx$0.29.
+productive elongation or terminated prematurely and was lost. The probability of
+productive escape (the productive fraction) was specified on a per-gene basis set
+near the $\approx$20\% inferred for mammalian promoters, where roughly 80\% of
+promoter-proximally paused RNAPII terminate prematurely (Zimmer et al., 2021, by
+STL-seq in human and \emph{Drosophila} cells; consistent with the
+rapid turnover of promoter-paused RNAPII seen by live imaging, Steurer et al., 2018).
+To reflect the lower premature-termination rates of highly expressed genes, we made
+the productive fraction increase with transcription activity, ranging from
+$\approx$0.14 for weakly transcribed genes to $\approx$0.47 for the most active genes,
+with a population median of $\approx$0.29.
 
 The model has a single pause-duration input: the \emph{single-polymerase pause dwell},
 the real time one polymerase stays paused before it escapes or terminates. We pinned its
 median to $\approx$42~s, the mean promoter-proximal residence time measured by live-cell
-imaging of endogenous Pol~II in human cells (Steurer et al., 2018), and anti-correlated
+imaging of endogenous RNAPII in human cells (Steurer et al., 2018), and anti-correlated
 it with activity so that the most active genes cleared the pause fastest ($\approx$25~s)
 and poised genes paused longer. The longer, multi-minute \emph{apparent} pause durations
 reported by genomic decay-rate measurements (a $\approx$7~min mean in mouse ES cells,
@@ -363,12 +354,13 @@ apparent pause was $\approx$2.6~min --- so one $\approx$42~s single-molecule dwe
 reproduces both the live-imaging and the decay-rate conventions.
 
 We drew per-gene activity from a heavy-tailed, power-law distribution spanning two to
-three orders of magnitude, approximating the broad, continuous spread of transcription
-rates across genes. Each gene's polymerase-loading propensity combined its pause-escape
-probability, a weak inverse power of its domain length (so genes in shorter, more active
-domains recruited more often) and a power-law scatter term, renormalised so that the
-geometric-mean loading of the expressed set met a fixed target and then scaled by an
-absolute per-class factor:
+three orders of magnitude, approximating the broad, continuous distribution of
+transcription rates observed across genes. Each gene's polymerase-loading propensity
+was determined by three factors: its pause-escape probability, a weak inverse power
+dependence on domain length (such that genes in shorter, more active domains recruited
+polymerase more often) and a power-law-distributed stochastic scatter term,
+renormalised such that the geometric-mean loading of the expressed set met a fixed
+target and was subsequently scaled by an absolute per-class factor:
 %
 \begin{equation}
 r_i = r_0\,\frac{\rho_i}{\big(\prod_{j\in\mathcal{E}}\rho_j\big)^{1/|\mathcal{E}|}}\;c_{c(i)},
@@ -382,26 +374,26 @@ over the expressed set $\mathcal{E}$, $c_{c(i)}$ its regulatory-class multiplier
 $p^{\mathrm{esc}}_i$ its pause-escape probability, $L_{T(i)}$ its domain length, $\tilde
 L$ the median gene-hosting domain length, $\eta\approx0.2$ a weak size exponent and
 $\pi_i$ a power-law (Zipf) scatter term (exponent $\gamma\approx2.4$). A defined
-fraction of the regulated-class genes was held effectively silent; rather than a hard
-zero, silent genes received a graded, near-zero loading spanning deep-silent (no
-initiation over the trajectory) up to a low basal/leaky level, so that the
-silent-to-expressed transition formed a continuum rather than a spike-and-gap, as in
-real transcriptomes.
+fraction of the regulated-class genes was held effectively silent. Rather than
+assigning these genes a loading rate of zero, we drew their loading propensities from
+a graded, near-zero range extending from deeply silent (no initiation over the
+trajectory) to a low basal (``leaky'') level. This produced a continuous transition
+between silent and expressed genes rather than an artificial spike-and-gap, consistent
+with real transcriptomes.
 
 Escaped polymerases translocated in their transcriptional direction at a gene-specific
 velocity drawn around a 2.1~kb\,min$^{-1}$ anchor (0.035~kb\,s$^{-1}$; per-gene range
 $\approx$0.5--6~kb\,min$^{-1}$), within the 1.3--4.3~kb\,min$^{-1}$ reported for
-mammalian Pol~II in vivo (Guo \& Price, 2013) and bracketing the 0.5--4~kb\,min$^{-1}$
-measured genome-wide in mouse ES cells (Jonkers et al., 2014); steric exclusion among
+mammalian RNAPII in vivo (Guo \& Price, 2013) and bracketing the 0.5--4~kb\,min$^{-1}$
+measured genome-wide in mouse ES cells (Jonkers et al., 2014). Steric exclusion among
 co-transcribing polymerases reduced the realised median to $\approx$1.9~kb\,min$^{-1}$,
 close to the rate assumed in genome-wide initiation inference (Zhao et al., 2023).
-Multiple polymerases could co-occupy a gene subject to steric exclusion, so
-inter-polymerase spacing emerged self-consistently. On reaching the 3$'$ end a
+Multiple polymerases could co-occupy a gene subject to steric exclusion, such that 
+inter-polymerase spacing emerged self-consistently. On reaching the 3$'$ end, a
 polymerase decelerated and dwelt over the termination zone for $\approx$1.8~min before
-release; this dwell represents the multi-kilobase termination window downstream of the
-poly(A) site (Fong et al., 2015), across which Pol~II decelerates from $>$2 to
-$<$1~kb\,min$^{-1}$ (Cortazar et al., 2019), and the terminating polymerase is the
-proximate cause of cohesin accumulation at 3$'$ ends. For regulated-class genes, pause
+release. This dwell represents the multi-kilobase termination window downstream of the
+poly(A) site (Fong et al., 2015), across which RNAPII decelerates from $>$2 to
+$<$1~kb\,min$^{-1}$ (Cortazar et al., 2019), and captures the cohesin accumulation associated with terminating polymerases at 3$'$ gene ends (Banigan et al., 2023). For regulated-class genes, pause
 escape was permitted only while the gene's promoter and a cognate enhancer were
 co-contained within a single cohesin loop, gating a subset of productive initiation on
 the instantaneous loop-extrusion state and reproducing the cohesin-dependence of
@@ -412,41 +404,44 @@ Across the population (122 genes $\times$ 20 replicate chains $=$ 2{,}440
 allele-instances; Fig.~\ref{fig:txn}), these kinetics reproduced genome-scale
 transcription statistics. About 69\% of alleles were detectably transcribed (productive
 output $>$0.05~transcripts\,h$^{-1}$); the rest formed a continuum from deep-silent to
-low basal output, with $\approx$23\% producing no completed transcript and $\approx$17\% never initiating at all. The typical
-detected allele made $\approx$1.3~transcripts\,h$^{-1}$ ($\approx$2.5 per diploid gene),
-close to the $\approx$2~mRNA\,h$^{-1}$ average synthesis rate measured genome-wide in
-mammalian cells (Schwanh\"ausser et al., 2011), and per-gene output was heavy-tailed,
-with a thin active tail reaching tens of transcripts\,h$^{-1}$. Promoter-proximal
-pausing was prevalent, with a median pausing (traveling-ratio) index of $\approx$6 over
-expressed genes, in line with the widespread pausing of mammalian genes (Day et al.,
-2016). The modeled locus is gene-rich and transcriptionally active --- more active than
-the genome-wide median --- yet its global output stays well below the
-\emph{hypertranscription} of cancer cells, which raise genome-wide RNA output roughly
-twofold (a mean $\approx$2.2-fold increase in total RNA output across human cancers,
-up to $\approx$3.5-fold in aggressive subtypes; Zatzman et al., 2022 --- a relative,
-genome-wide ratio, not a per-allele rate), an amplification of the existing expression
-program associated with elevated MYC (Lin et al., 2012; though MYC's direct action is
-substantially gene-selective, Sab\`o et al., 2014; Walz et al., 2014). The hottest
-model genes accordingly fall short of cancer-line single-gene maxima: our top alleles
-reach $\approx$1.3 productive events\,min$^{-1}$ \emph{per allele} ($\approx$2.6 per
-diploid gene), whereas a strongly induced gene such as HSPA1A reaches $\approx$87
-events\,min$^{-1}$ \emph{per cell} upon heat-shock induction in the hyper-transcribing
-human line K562 (Gressel et al., 2019). (All per-gene rates we report for the model are
-per allele; a diploid gene is twice that.) Our parameters thus describe an active,
-non-malignant locus, and a single loading-rate constant tunes the overall level between
-these regimes.
+low basal output, with $\approx$23\% producing no completed transcript and $\approx$17\%
+never initiating at all. The typical detected allele made
+$\approx$1.3~transcripts\,h$^{-1}$ ($\approx$2.6 per diploid gene), close to the
+$\approx$2~mRNA\,h$^{-1}$ average synthesis rate measured genome-wide in mammalian cells
+(Schwanh\"ausser et al., 2011). Per-gene output was heavy-tailed, with a thin active
+tail reaching tens of transcripts\,h$^{-1}$. Promoter-proximal pausing was prevalent,
+with a median pausing (travelling-ratio) index of $\approx$6 over expressed genes, in
+line with the widespread pausing of mammalian genes (Day et al., 2016). The modelled
+locus is gene-rich and transcriptionally active, with expression levels above the
+genome-wide median. However, its global output remains well below the
+\emph{hypertranscription} of cancer cells, where total RNA production is increased
+approximately twofold on average across human cancers and by as much as 3.5-fold in
+aggressive subtypes (Zatzman et al., 2022). These values describe genome-wide
+amplification of RNA output rather than per-allele transcription rates. Such
+hypertranscription is frequently associated with elevated MYC activity (Lin et al.,
+2012), although MYC regulates transcription in a substantially gene-selective manner
+rather than acting as a universal amplifier (Sab\`o et al., 2014; Walz et al., 2014).
+The most active genes in simulation accordingly fall short of cancer-line single-gene
+maxima: our top alleles reach $\approx$1.3 productive events\,min$^{-1}$ \emph{per
+allele} ($\approx$2.6 per diploid gene), whereas a strongly induced gene such as HSPA1A
+reaches $\approx$87 events\,min$^{-1}$ \emph{per cell} upon heat-shock induction in the
+hyper-transcribing human line K562 (Gressel et al., 2019). Model transcription rates
+are reported on a per-allele basis throughout. Our parameters thus describe an active,
+non-malignant locus, with the overall output level controlled by a single loading-rate
+parameter.
 
 % =====================================================================
-\section{RNA polymerase II -- cohesin interactions}
+\section{RNAPII -- cohesin interactions}
 
 We treated an engaged polymerase as a permeable, motile barrier to extrusion
 (Banigan et al., 2023), resolving two encounter geometries. When a cohesin subunit
-attempted to step onto a polymerase-occupied site it succeeded only stochastically;
-the mean transit time past a transcriptionally engaged (paused, elongating or
-terminating) polymerase was $\approx$100~s, the bypass rate ($\approx$0.01~s$^{-1}$)
-that best reproduces transcription's effect on contact maps (Banigan et al., 2023).
-Two quantities define this barrier, the per-step probability that a subunit is
-blocked rather than passing, and the velocity margin that makes the barrier directional:
+attempted to step onto a polymerase-occupied site, it succeeded only stochastically.
+The mean transit time past a transcriptionally engaged (paused, elongating or
+terminating) polymerase was $\approx$100~s, corresponding to a bypass rate of
+$\approx$0.01~s$^{-1}$, which best reproduces the effects of transcription on contact
+maps (Banigan et al., 2023). Two quantities define this barrier, the per-step
+probability that a subunit is blocked rather than passing, and the velocity margin
+that makes the barrier directional:
 %
 \begin{equation}
 p_{\mathrm{block}} = e^{-\Delta t/\tau_{\mathrm{bypass}}},
@@ -460,11 +455,12 @@ p_{\mathrm{block}} = e^{-\Delta t/\tau_{\mathrm{bypass}}},
 A merely pre-initiation polymerase was $\approx$8-fold more permeable
 ($\tau_{\mathrm{bypass}}\approx 12$~s). We did not accelerate the turnover of a
 cohesin held against a polymerase: its unbinding rate remained the baseline value.
-The framework permits an accelerated cohesin-eviction regime (the analogue of the
-Wapl-mediated release that frees active genes of cohesin in vivo; Busslinger et al.,
-2017), but a short eviction lifetime depletes rather than accumulates cohesin at
-active genes, so we left it inactive: the gene-body and 3$'$ enrichment arose
-entirely from the moving-barrier relocation described next.
+The framework permits an accelerated cohesin-eviction regime, analogous to the
+WAPL-mediated release that removes cohesin from active genes in vivo (Busslinger et
+al., 2017). However, short eviction lifetimes depleted cohesin from active genes
+rather than generating the experimentally observed enrichment. We therefore did not
+employ the accelerated eviction regime. Gene-body and 3$'$ enrichment instead arose
+entirely from the moving-barrier mechanism described below.
 
 Reciprocally, an elongating polymerase that collided with a cohesin subunit most
 often relocated it (displacing the subunit ahead and translating the loop along
@@ -473,27 +469,28 @@ co-directional; non-elongating polymerases did not relocate cohesin. This rectif
 interaction drove cohesin accumulation at and beyond 3$'$ ends and the formation of
 cohesin islands between convergent genes (Banigan et al., 2023; Busslinger et al.,
 2017). In the polymerase-free configurations (the transcription-off control and the
-repair experiments) these interactions were absent and cohesin responded only to
-boundaries, other cohesins and lesions.
+repair experiments), these interactions were absent and cohesin responded only to
+boundaries, other cohesins, and lesions.
 
 % =====================================================================
 \section{Lesions}
 
 We represented ultraviolet photoproducts, predominantly cyclobutane pyrimidine
-dimers and 6-4 photoproducts, the substrates of nucleotide-excision repair (NER),
-as damaged lattice sites that were induced at a controlled density, progressed
-through a two-stage repair trajectory and were excised. We maintained the
-population homeostatically at a fixed target $M$ equal to the lattice length divided
-by the chosen lesion spacing $s$ (the experimental analogue of UV dose; below),
+dimers and 6-4 photoproducts, as damaged lattice sites. These lesions, the principal
+substrates of nucleotide-excision repair (NER), were induced at a controlled density
+and were made to undergo a two-stage repair process before excision. We maintained
+the population homeostatically at a fixed target $M$ equal to the lattice length
+divided by the chosen lesion spacing $s$ (the experimental analogue of UV irradiation; below),
 %
 \begin{equation}
 M = \left\lfloor \frac{L_{\mathrm{tot}}}{s} \right\rfloor.
 \end{equation}
 %
-On each step we advanced existing lesions, deleted those that completed repair, and
-spawned new lesions until the target was restored, so that the steady-state damage
-burden was constant while individual lesions turned over; on the first step the
-population was seeded directly by the spawner.
+At each simulation step, we progressed existing lesions through their repair states,
+removed lesions that had completed repair, and spawned new lesions until the target
+abundance was restored, maintaining a constant steady-state damage burden despite
+continual lesion turnover. At the start of each simulation, the lesion population was
+seeded directly by the spawner.
 
 We spawned each new lesion by weighted random sampling of lattice sites. Every site
 $i$ carried a weight equal to the length of its host domain raised to a negative
@@ -508,22 +505,22 @@ P(\text{induce at site } i) = \frac{L_{T(i)}^{-\alpha}}{\sum_{j} L_{T(j)}^{-\alp
 where $L_{T(i)}$ is the length of the domain containing site $i$ and $\alpha$ the
 steepness of the size bias (the configuration key \texttt{lesion\_tad\_size\_exponent};
 here $\alpha=1$). The per-tick deficit was drawn in batches and rejection-sampled
-(sites already carrying a lesion were rejected and redrawn), and because the weights
-are normalised, any reference length cancels and only the \emph{relative} domain
-lengths enter. The exponent sets how the fixed damage budget $M$ partitions across
-domains: a domain of length $L$ spans $L$ sites, each weighted $L^{-\alpha}$, so its
-expected share of lesions scales as $L\cdot L^{-\alpha}=L^{1-\alpha}$. At $\alpha=0$
-induction is spatially uniform, with a domain's lesion count growing in proportion to its
-length, at constant per-kilobase density; at $\alpha=1$, the value we used, every
-domain accrues in expectation a similar \emph{number} of lesions regardless of size,
-so the per-kilobase damage density scales as $1/L$ and shorter domains are
-proportionally more heavily damaged; at $\alpha>1$ shorter domains would carry more
-damage even in absolute count. Every new lesion entered in the pre-repair state. The
-same inverse-domain-length bias, through the exponent $\beta$ of Eq.~10, also speeds
-recognition and repair in shorter domains, so chromatin context shapes both ends of
-the lesion life cycle.
+(sites already carrying a lesion were rejected and redrawn). Because the weights
+are normalised, any reference length cancels, leaving only relative domain lengths.
+The exponent sets how the fixed damage budget $M$ partitions across domains: a domain
+of length $L$ spans $L$ sites, each weighted $L^{-\alpha}$, so its expected share of
+lesions scales as $L\cdot L^{-\alpha}=L^{1-\alpha}$. At $\alpha=0$, induction is
+spatially uniform, with a domain's lesion count growing in proportion to its length,
+at constant per-kilobase density. At $\alpha=1$, the value we used, every domain
+accrues in expectation a similar \emph{number} of lesions regardless of size, such
+that the per-kilobase damage density scales as $1/L$ and shorter domains are
+proportionally more heavily damaged. At $\alpha>1$, shorter domains would carry more
+damage even in absolute count. All newly introduced lesions entered the pre-repair
+state. The same inverse-domain-length bias, through the exponent $\beta$ of Eq.~10,
+also accelerates recognition and repair in shorter domains; thus chromatin context
+shapes both ends of the lesion life cycle.
 
-Lesion spacing is the experimental analogue of UV dose; our wet-lab experiments used
+Lesion spacing is the experimental analogue of UV irradiation; our wet-lab experiments used
 20~J\,m$^{-2}$ UVC, which generates $\approx$1 photolesion (CPD and 6-4PP combined) per
 15~kb of single-stranded DNA (Quinet et al., 2016, after Andrade-Lima et al., 2015),
 i.e.\ $\approx$1 per 7.5~kb of duplex DNA (derived from the per-strand value). With the assumption that UV photoproduct yield is approximately linear in dose over this range,
@@ -558,11 +555,11 @@ Lesion spacing (duplex DNA) & Lesion density & UVC dose & Basis \\
 \end{tabularx}
 
 \medskip
-We typed each lesion at the moment of induction. A lesion falling within a gene body
-was assigned to the transcription-coupled pathway (TC-NER; ``Type A'') with a fixed
-probability (the TC-NER fraction) and otherwise to the global-genome pathway
-(GG-NER; ``Type B'');
-every lesion outside a gene body was GG-NER,
+We assigned each lesion to a repair pathway at the moment of induction. A lesion
+within a gene body was classified as a transcription-coupled repair lesion (TC-NER;
+``Type A'') with a fixed probability (the TC-NER fraction) and otherwise as a
+global-genome repair lesion (GG-NER; ``Type B''); lesions outside gene bodies were
+always assigned to GG-NER,
 %
 \begin{equation}
 P(\text{TC-NER}\mid i) =
@@ -573,24 +570,23 @@ f_A, & i \in \text{gene body},\\[2pt]
 \qquad f_A \le \tfrac{1}{2},
 \end{equation}
 %
-the complement being GG-NER. TC-NER lesions represent damage on the transcribed
-strand of an active gene, where an elongating polymerase arrests: the stalled
-polymerase both designates the lesion for rapid, dedicated repair and constitutes
-the physical obstruction, and these lesions are the model's representation of
-polymerase-stalling events. GG-NER lesions (intergenic damage and the
-non-transcribed-strand or non-stalling remainder within genes) are recognised by
-the genome-wide surveillance pathway. We treated the TC-NER fraction as a swept
-quantity; because only the transcribed strand of an active gene yields a stalling
-event and the slowly excised cyclobutane dimers dominate persistent stalls, its
-physical ceiling is one-half and its realistic value $\approx$one-quarter. In a
-control in which global-genome repair was disabled, the transcription-coupled
-lesions were instead held at their unchanged expected count and drawn only from
-gene-body sites, so that the TC-NER burden matched the full-repair run rather than
-being inflated.
+with the complement assigned to GG-NER. TC-NER lesions represent damage on the
+transcribed strand of an active gene, where an elongating polymerase arrests. The
+stalled polymerase both designates the lesion for rapid, dedicated repair and acts as
+the extrusion barrier represented in the model. GG-NER lesions comprise intergenic
+damage and the non-transcribed strand or non-stalling remainder within genes and are
+recognised by genome-wide surveillance. We treated the TC-NER fraction as a swept
+parameter. Because only lesions on the transcribed strand of an active gene generate
+polymerase-stalling events, its theoretical upper bound is 0.5, whereas a value near
+0.20 is more biologically realistic owing to the predominance of slowly excised
+cyclobutane dimers. In control simulations lacking global-genome repair, the expected
+number of TC-NER lesions was held constant and lesions were sampled exclusively from
+gene bodies, ensuring that the TC-NER burden matched that of the full-repair
+simulations rather than being artificially inflated.
 
 Each lesion then followed a two-state, memoryless repair trajectory with no internal
-countdown, exactly as for cohesin turnover. At every step a pre-repair lesion
-advanced to the repair state, and a repair-state lesion was excised and removed,
+countdown, analogous to the treatment of cohesin turnover. At every step, pre-repair
+lesions advanced to the repair state and repair-state lesions were excised and removed,
 with per-step probabilities
 %
 \begin{equation}
@@ -605,46 +601,44 @@ p_{\mathrm{REP}\to\varnothing}
 %
 with mean pre-repair time $\tau_{\mathrm{pre}}\approx40$~min, mean repair time
 $\tau_{\mathrm{rep}}\approx6$~min, $\bar L$ the mean domain length and $\beta=1$. The
-multiplier $\mu_i$ exceeds one in shorter-than-average domains and is below one in
-longer ones (the per-step probability itself being capped at one, via the $\min$), so
-lesions in shorter domains were recognised and repaired faster and those in longer
-domains more slowly, the same chromatin-context dependence acting on repair as on
-induction. The stage durations
-and the lesion density jointly set the steady-state probability that any site
-carries an obstructing lesion.
+multiplier $\mu_i$ exceeds one in shorter-than-average domains and is less than one in
+longer domains (the per-step probability itself being capped at one, via the $\min$).
+Consequently, lesions in shorter domains were recognised and repaired more rapidly,
+whereas those in longer domains were repaired more slowly. Thus, the same
+chromatin-context dependence governed both lesion induction and lesion repair. The
+stage durations and the lesion density jointly set the steady-state probability that
+any site carries an obstructing lesion.
 
 % =====================================================================
 \section{Lesion -- cohesin interactions}
 
-In the lesion experiments transcription was switched off and no transcribing
-polymerases were simulated; instead, a transcription-coupled (Type~A) lesion in its
-pre-repair stage stood in for the elongating polymerase stalled at the damage,
-supplying the same cohesin obstruction at the same genomic site. We adopted this static
-stand-in rather than dynamically simulating a polymerase arresting at a lesion, being
-displaced during repair and re-initiating afterwards, because the kinetics of
-transcription recovery after UV damage --- the timing of polymerase removal,
-repair-coupled restart and re-initiation --- are not characterised well enough to
-parameterise a dynamic transcription--lesion coupling. The lesion field therefore
-represents the steady-state obstruction that stalled polymerases and bound repair
-machinery present to loop extrusion, without committing to an under-determined recovery
-timescale.
+In the lesion simulations, transcription was disabled and no transcribing polymerases
+were explicitly modelled. Instead, a transcription-coupled (Type~A) lesion in its
+pre-repair stage served as a proxy for a polymerase stalled at the damage, providing
+an equivalent obstacle to cohesin extrusion at the same genomic site. We adopted this
+representation rather than explicitly modelling polymerase stalling, removal,
+repair-coupled restart and re-initiation because the kinetics of transcription
+recovery after UV damage remain insufficiently constrained to support reliable
+parameterisation. The lesion field therefore represents the steady-state extrusion
+barrier imposed by stalled polymerases and associated repair complexes without
+assuming a specific transcription-recovery timescale.
 
 A lesion's effect on cohesin was conditioned on its repair stage and pathway. A
-lesion in the active repair stage, of either pathway, arrested an incident cohesin
-subunit with high per-step probability ($\approx$0.993; bypass $\approx$0.007 per step), representing the bound
-repair machinery occluding the duplex. A TC-NER lesion in the pre-repair stage
-arrested cohesin only in the polymerase-free configurations, where it substituted
-for the stalled polymerase that would otherwise provide the obstruction; when
-polymerases were simulated the block was supplied by the genuine arrested polymerase
-(Section~5) and the lesion did not independently arrest cohesin in this stage,
-avoiding double counting. A GG-NER lesion in the pre-repair stage was
-transparent to cohesin, there being no occluding complex before machinery assembly.
-An arrested subunit failed to advance for as long as the lesion persisted and was
-released when the lesion completed repair or the complex turned over at the baseline
-rate (no accelerated eviction, as for a polymerase barrier; Section~5). Because only
-the leading subunit was tested per step, a complex continued extruding on its
-unobstructed side while one subunit was arrested, the mechanism by which a field
-of lesions reshapes, rather than abolishes, the distribution of cohesin loops.
+lesion in the active repair stage of either pathway arrested an incident cohesin
+subunit with high per-step probability ($\approx$0.993; bypass $\approx$0.007 per
+step), representing the bound repair machinery occluding the duplex. A TC-NER lesion in
+the pre-repair stage arrested cohesin only in the polymerase-free configurations, where
+it substituted for the stalled polymerase that would otherwise provide the obstruction.
+When polymerases were simulated, the block was supplied by the explicitly modelled
+stalled polymerase (Section~5) and the lesion did not independently arrest cohesin in
+this stage, avoiding double counting. A GG-NER lesion in the pre-repair stage was
+transparent to cohesin because no obstructing complex is present prior to assembly of
+the repair machinery. An arrested subunit remained stalled until either the lesion was
+removed upon repair completion or the cohesin complex turned over at the baseline rate
+(no accelerated eviction, as for a polymerase barrier; Section~5). Because only the
+leading subunit was tested at each step, a cohesin complex continued extruding on its
+unobstructed side while the opposite subunit remained arrested, allowing lesion fields
+to reshape rather than abolish the distribution of cohesin loops.
 
 % =====================================================================
 \section{Simulation pipeline}
@@ -653,38 +647,42 @@ All results were produced by a single driver, executing the configurations and
 analyses in a fixed sequence under the calibration of Section~1 (250~bp per site, 2~s
 per step; $\approx$22~h equilibration and $\approx$89~h production per run).
 
-We generated a 10-Mb locus (122 genes across 10 domains) and instantiated it as
-twenty independent replicates, producing two matched configurations: a
-transcription-on baseline with active polymerases, and a transcription-off control
-with identical genes, domains and boundaries but no polymerases, whose contrast
-isolates the effect of transcription at fixed architecture. In this comparison,
-transcription shortened the mean cohesin loop (from $\approx$248 to $\approx$216~kb),
-enriched cohesin within gene bodies ($\approx$1.1-fold), and depleted it from CTCF
-boundaries ($\approx$1.3-fold) and from domain-spanning corner dots ($\approx$4.4-fold) relative
-to the transcription-off control (all $P<0.001$ over the twenty replicates), the
-moving-barrier signature of transcription on chromosome folding (Banigan et al., 2023).
-We simulated both and,
-across the two conditions, compared a panel of cohesin-distribution metrics (defined in
-Table~3): the mean loop length, cohesin occupancy at gene bodies and at CTCF boundaries,
-boundary-pass (read-through) events, boundary-crossing stripes and the corner-dot frequency.
-We swept boundary arrest probabilities
-up to $\approx$6-fold to map the dependence of the cohesin distribution on insulation
-strength. In the polymerase-free condition we introduced lesions and
-performed three two-dimensional sweeps: the TC-NER (polymerase-stalling) fraction
-against lesion density; the per-step blocking probability against density; and
-the recognition and repair timescales against density. In these experiments the
-pre-repair stage lasted $\approx$40~min, the repair stage $\approx$6~min, the
-per-step block probability was $\approx$0.993, and boundaries were at the
-strengthened (3.25-fold) setting. Finally, keeping transcription active in both the swept grid
-and the reference, we mapped the cohesin-distribution metrics over a two-dimensional grid of
-cohesin residence times, the
-free cohesin lifetime against the CTCF-captured (WAPL-protected) lifetime, each scanned from
-one-eighth to sixfold of its calibrated value and reported as fold changes relative to the
-transcription-on baseline, to separate the contributions of extrusion processivity and CTCF stabilisation
-to loop length and boundary occupancy.
+We generated a 10-Mb locus comprising 122 genes distributed across 10 domains and
+instantiated it as twenty independent replicates. From each replicate we generated two
+matched configurations: a transcription-on baseline containing active polymerases and a
+transcription-off control with identical genes, domains and boundaries but no
+polymerases. Comparison of these configurations isolates the effects of transcription
+at fixed chromosomal architecture.
+
+Relative to the transcription-off control, transcription reduced the mean loop length
+(from $\approx$248 to $\approx$216~kb), increased cohesin occupancy within gene bodies
+($\approx$1.1-fold), and decreased cohesin occupancy at CTCF boundaries
+($\approx$1.3-fold) and domain-spanning corner dots ($\approx$4.4-fold; all $P<0.001$
+across 20 replicates), the moving-barrier signature of transcription on chromosome
+folding (Banigan et al., 2023). Across both conditions we quantified the
+cohesin-distribution metrics defined in Table~3, including mean loop length, cohesin
+occupancy at gene bodies and at CTCF boundaries, boundary-pass (read-through) events,
+boundary-crossing stripes and corner-dot frequency.
+
+To examine the effect of insulation strength on cohesin distribution, we varied
+boundary arrest probabilities up to $\approx$6-fold relative to their calibrated values.
+In polymerase-free simulations, lesions were introduced and three two-dimensional
+parameter sweeps were performed: TC-NER (polymerase-stalling) fraction versus lesion
+density, per-step lesion-blocking probability versus lesion density, and recognition and
+repair timescales versus density. In these experiments the pre-repair stage lasted
+$\approx$40~min, the repair stage $\approx$6~min, the per-step block probability was
+$\approx$0.993, and boundary strengths were fixed at 3.25 times their calibrated values.
+
+Finally, keeping transcription active in both the reference and perturbed simulations,
+we mapped the cohesin-distribution metrics across a two-dimensional grid spanning free
+cohesin residence time and CTCF-captured (WAPL-protected) residence time. Each parameter
+was varied from one-eighth to sixfold of its calibrated value, and results were reported
+as fold changes relative to the transcription-on baseline. This analysis separated the
+contributions of extrusion processivity and CTCF stabilisation to loop length and
+boundary occupancy.
 
 \medskip
-\noindent\textbf{Table 3. Cohesin-distribution metrics.} All are computed from the
+\noindent\textbf{Table 3. Cohesin-distribution metrics.} All metrics are computed from the
 one-dimensional cohesin trajectories (one complex $=$ two subunits; 1~site $=$ 250~bp; 2~s per
 sampled frame) and averaged over all sampled frames and the twenty replicates; a site counts
 as a CTCF anchor when it lies in the oriented capture window of a domain boundary.
@@ -724,8 +722,6 @@ contact map. \\
 \begin{enumerate}\setlength{\itemsep}{2pt}
 \item Dixon, J. R. et al. Topological domains in mammalian genomes identified by
 analysis of chromatin interactions. \textit{Nature} 485, 376--380 (2012).
-\item Rao, S. S. P. et al. A 3D map of the human genome at kilobase resolution
-reveals principles of chromatin looping. \textit{Cell} 159, 1665--1680 (2014).
 \item Kagey, M. H. et al. Mediator and cohesin connect gene expression and
 chromatin architecture. \textit{Nature} 467, 430--435 (2010).
 \item Busslinger, G. A. et al. Cohesin is positioned in mammalian genomes by
@@ -768,13 +764,14 @@ of gene regulation. \textit{Genes Dev.} 33, 960--982 (2019).
 \item Guo, J. \& Price, D. H. RNA polymerase II transcription elongation control.
 \textit{Chem. Rev.} 113, 8583--8603 (2013).
 \item Fong, N. et al. Effects of transcription elongation rate and Xrn2 exonuclease
-activity on RNA polymerase II termination. \textit{Mol. Cell} 60, 256--267 (2015).
+activity on RNA polymerase II termination suggest widespread kinetic competition.
+\textit{Mol. Cell} 60, 256--267 (2015).
 \item Cortazar, M. A. et al. Control of RNA Pol II speed by PNUTS-PP1 and Spt5
 dephosphorylation facilitates termination by a ``sitting duck torpedo'' mechanism.
-\textit{Mol. Cell} 76, 896--908 (2019).
+\textit{Mol. Cell} 76, 896--908.e4 (2019).
 \item Zimmer, J. T., Rosa-Mercado, N. A., Canzio, D., Steitz, J. A. \& Simon, M. D.
 STL-seq reveals pause-release and termination kinetics for promoter-proximal paused
-RNA polymerase II transcripts. \textit{Mol. Cell} 81, 4398--4412 (2021).
+RNA polymerase II transcripts. \textit{Mol. Cell} 81, 4398--4412.e7 (2021).
 \item Schwanh\"ausser, B. et al. Global quantification of mammalian gene expression
 control. \textit{Nature} 473, 337--342 (2011).
 \item Day, D. S. et al. Comprehensive analysis of promoter-proximal RNA polymerase II
