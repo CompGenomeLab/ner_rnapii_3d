@@ -124,8 +124,8 @@ Parameter & Calibrated value & Basis \\
 \multicolumn{3}{@{}l}{\textit{System}}\\
 Spatial resolution & 250~bp per site & calibration \\
 Temporal resolution & 2~s per step & calibration \\
-Simulated locus & 10~Mb $\times$ 20 replicates (200~Mb) & --- \\
-Equilibration / production & $\approx$22~h / $\approx$89~h & --- \\
+Simulated locus & 10~Mb $\times$ 20 replicates (200~Mb) & -- \\
+Equilibration / production & $\approx$22~h / $\approx$89~h & -- \\
 \addlinespace
 \multicolumn{3}{@{}l}{\textit{Loop extrusion}}\\
 Cohesin separation (density) & one complex per 240~kb & Gabriele et al., 2022 \\
@@ -137,7 +137,7 @@ Processivity (emergent) & a few $\times\,10^{2}$~kb & cf.\ $\approx$150~kb (Gabr
 Recruitment & uniform & Banigan et al., 2023 \\
 \addlinespace
 \multicolumn{3}{@{}l}{\textit{Transcription}}\\
-Promoter-proximal pause & $\approx$250~bp downstream & --- \\
+Promoter-proximal pause & $\approx$250~bp downstream & -- \\
 Single-Pol pause (median / active) & $\approx$42~s / $\approx$25~s & $\approx$42~s mean live-cell residence (Steurer et al., 2018); $\approx$1.2--1.4~min model half-life (Zhao et al., 2023); multi-minute by decay-rate (Jonkers et al., 2014; Core \& Adelman, 2019) \\
 Productive fraction (median; activity-graded) & $\approx$0.29 (range $\approx$0.14--0.47) & $\approx$0.2 ($\approx$80\% premature termination), STL-seq (Zimmer et al., 2021) \\
 Initiation / loading, expressed (realised) & median $\approx$0.27~min$^{-1}$ (occupied genes); $\approx$0.05 all-gene & low $\approx$0.2 / high $\approx$1.0~min$^{-1}$ (Zhao et al., 2023); pause-initiation limit (Gressel et al., 2019) \\
@@ -147,15 +147,15 @@ Elongation velocity & 2.1~kb\,min$^{-1}$ (0.035~kb\,s$^{-1}$); $\approx$1.9 real
 \addlinespace
 \multicolumn{3}{@{}l}{\textit{RNAPII -- cohesin}}\\
 Cohesin transit past engaged RNAPII & $\approx$100~s ($k \approx 0.01$~s$^{-1}$) & Banigan et al., 2023 \\
-Cohesin transit past pre-initiation RNAPII & $\approx$12~s ($\approx$8$\times$ more permeable) & --- \\
+Cohesin transit past pre-initiation RNAPII & $\approx$12~s ($\approx$8$\times$ more permeable) & -- \\
 Subunit : elongation velocity ratio & $\approx$3.6 (loop $\approx$7) & Banigan et al., 2023 ($\ge$3--5) \\
 \addlinespace
 \multicolumn{3}{@{}l}{\textit{Lesions and repair}}\\
 Lesion density (swept) & 1 per 7--100~kb (20~J\,m$^{-2}$; repair time-course, Table~2) & \S6 \\
-TC-NER (Type A) fraction of gene-body lesions & $\le 0.5$ (ceiling); $\approx$0.20 (typical) & --- \\
-Pre-repair stage & $\approx$40~min & --- \\
-Active repair stage & $\approx$6~min & --- \\
-Per-step block, repair stage & $\approx$0.993 (bypass $\approx$0.007 / step) & --- \\
+TC-NER (Type A) fraction of gene-body lesions & $\le 0.5$ (ceiling); $\approx$0.20 (typical) & -- \\
+Pre-repair stage & $\approx$40~min & -- \\
+Active repair stage & $\approx$6~min & -- \\
+Per-step block, repair stage & $\approx$0.993 (bypass $\approx$0.007 / step) & -- \\
 \end{longtable}
 
 % =====================================================================
@@ -299,7 +299,7 @@ pause one lattice site ($\approx$250~bp) downstream of the start site (the singl
 lattice resolution, coarser than the physiological $\sim$30--60~bp pause position). A
 paused polymerase \emph{occluded} the promoter: while it occupied the promoter-proximal
 window, it suppressed the loading of a new polymerase; thus gene throughput was limited by
-the rate of pause escape rather than by recruitment --- the pause--initiation limit
+the rate of pause escape rather than by recruitment, the pause--initiation limit
 (Gressel et al., 2019). We therefore controlled output through pause-escape kinetics; increasing the recruitment rate alone only increased promoter-proximal occupancy without raising productive output.
 
 \begin{figure}[tp]
@@ -339,19 +339,20 @@ the productive fraction increase with transcription activity, ranging from
 $\approx$0.14 for weakly transcribed genes to $\approx$0.47 for the most active genes,
 with a population median of $\approx$0.29.
 
-The model has a single pause-duration input: the \emph{single-polymerase pause dwell},
-the real time one polymerase stays paused before it escapes or terminates. We pinned its
-median to $\approx$42~s, the mean promoter-proximal residence time measured by live-cell
-imaging of endogenous RNAPII in human cells (Steurer et al., 2018), and anti-correlated
-it with activity so that the most active genes cleared the pause fastest ($\approx$25~s)
-and poised genes paused longer. The longer, multi-minute \emph{apparent} pause durations
-reported by genomic decay-rate measurements (a $\approx$7~min mean in mouse ES cells,
-Jonkers et al., 2014; a $\approx$2--30~min range across studies, Core \& Adelman, 2019)
-are \emph{not} a second input: they are what that same paused state reads as when pause
-occupancy is divided by the much lower productive output (because most paused
-polymerases terminate prematurely, as above). Measured that way, the model's
-apparent pause was $\approx$2.6~min --- so one $\approx$42~s single-molecule dwell
-reproduces both the live-imaging and the decay-rate conventions.
+A single parameter sets how long a polymerase stays paused before it escapes into
+elongation or terminates. We set the median of this dwell to $\approx$42~s, the promoter-proximal
+residence time of endogenous RNAPII measured by live-cell imaging in human cells
+(Steurer et al., 2018), and let it vary inversely with transcriptional activity, so that
+the most active genes cleared the pause within $\approx$25~s and poised genes dwelt
+longer. Population measurements report much longer pause durations: multi-minute
+half-lives from transcription-inhibitor decay assays (a $\approx$7~min mean in mouse ES
+cells, Jonkers et al., 2014; a $\approx$2--30~min range across studies, Core \& Adelman,
+2019). These exceed the single-molecule dwell because pause duration estimated at the
+population level depends strongly on the metric: in the model, although each polymerase
+dwells only $\approx$42~s, pause occupancy divided by productive output (inflated by
+the large fraction of polymerases that terminate before completing a transcript)
+gives an apparent pause of $\approx$2.6~min. A single seconds-scale dwell is thus
+consistent with both the single-molecule and the longer population-level estimates.
 
 We drew per-gene activity from a heavy-tailed, power-law distribution spanning two to
 three orders of magnitude, approximating the broad, continuous distribution of
