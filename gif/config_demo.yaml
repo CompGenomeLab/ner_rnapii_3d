@@ -1,0 +1,114 @@
+# =============================================================================
+# ner_rnapii_3d -- compact single-locus DEMONSTRATION config
+# =============================================================================
+# A deliberately SMALL, single-chain locus (600 sites x 250 bp = 150 kb) tuned
+# for a legible animation rather than for quantitative realism. Unlike the
+# shipped 10k configs -- which enable RNAPII and lesions SEPARATELY -- this one
+# turns on EVERY mechanic at once so a single run demonstrates all features:
+#
+#   * convergent per-TAD oriented CTCF barriers (incl. one leaky boundary)
+#   * gene classes (housekeeping / cell-type / developmental) + enhancers
+#   * cohesin loop extrusion with CTCF capture, bypass and turnover
+#   * single-molecule RNAPII traffic (pre-init / pause / elongation / termination)
+#   * UV lesions with TC-NER (Type A) / GG-NER (Type B) two-state repair
+#
+# Rates are BOOSTED vs. the calibrated configs so every event type is visible
+# within a short (~1600-tick) trajectory. This file is for the demo GIF only.
+lef:
+  bp_per_site: 250
+  chain_length: 600
+  num_chains: 1
+  separation: 60           # -> 10 cohesins on the locus
+  lifetime: 180            # base cohesin residence (ticks)
+  lifetime_stalled: 180
+  lifetime_ctcf: 720       # CTCF-captured cohesin is long-lived -> stable TAD loops
+  tick_seconds: 2
+  warmup_steps: 150        # let a few loops form before recording starts
+  trajectory_length: 1600
+  chunk_size: 50
+  seed: 1111
+  max_rnapii: 48
+
+  topology_kwargs:
+    # ---- oriented per-TAD CTCF barriers (convergent) ----------------------
+    tads:
+      - {left: 0,   right: 129, left_strength: 1.0,  right_strength: 0.90}
+      - {left: 130, right: 269, left_strength: 0.90, right_strength: 0.45}  # leaky -> bypass
+      - {left: 270, right: 399, left_strength: 0.45, right_strength: 0.90}
+      - {left: 400, right: 519, left_strength: 0.90, right_strength: 0.85}
+      - {left: 520, right: 599, left_strength: 0.85, right_strength: 1.0}
+    default_boundary_strength: 0.90
+    release_prob: 0.0
+    include_chromosome_ends: true
+
+    # ---- RNAPII moving-barrier / kinetics (Banigan-style) -----------------
+    lifetime_rnapii_stalled: 180
+    rnapii_stride: 1
+    rnapii_termination_step_prob: 0.20
+    rnapii_stall_prob: 0.0
+    rnapii_push_prob: 0.0
+    rnapii_headon_push_prob: 1.0
+    rnapii_pause_cohesin_restraint: 1.0
+    rnapii_pause_restraint_window: 1
+    rnapii_pause_term_prob: 0.04
+    rnapii_pre_initiation_block_prob: 0.85
+    rnapii_paused_block_prob: 0.98
+    rnapii_elongating_block_prob: 0.98
+    rnapii_terminating_block_prob: 0.98
+    rnapii_promoter_occlusion: true
+    ep_contact_tolerance: 2
+
+    # ---- loading stays uniform (numba-eligible: no targeted placement) -----
+    replicate_genes_across_chains: true
+    targeted_load_prob: 0.0
+    loading_window: 1
+    target_enhancers: false
+    target_tss: false
+    weight_loading_by_activity: false
+
+    # ---- UV lesions / NER --------------------------------------------------
+    lesion_spacing: 50           # steady-state lesions = 600 // 50 = 12
+    lesion_type_a_prob: 0.45     # P(Type A | in a gene body); off-gene -> Type B
+    lesion_prerecognition_ticks: 260
+    lesion_repair_ticks: 150
+    lesion_block_prob: 0.95
+    lesion_tad_size_exponent: 1.0
+    lesion_tad_repair_exponent: 0.0
+    lesion_type_b_enabled: true
+
+    # ---- genes: 3 classes x active/poised/silent --------------------------
+    # hk_const  : constitutive (no enhancer required)        -> ACTIVE
+    # celltype  : pause-release gated by E-P loop contact     -> POISED -> ACTIVE
+    # dev       : gated + low kinetics                        -> POISED / SILENT
+    genes:
+      - {tss: 30,  tes: 100, load_prob: 0.028, requires_enhancer: false, load_requires_enhancer: false,
+         initiation_prob: 0.60, pause_release_prob: 0.070, elongation_step_prob: 0.42, pause_offset: 1,
+         termination_prob: 0.03, termination_window: 12, pause_term_prob: 0.03, gene_class: hk_const}
+      # enhancers sit UPSTREAM of the promoter (5'), outside the transcribed body,
+      # but within the same TAD so a cohesin loop can still bracket the E-P pair.
+      - {tss: 155, tes: 235, load_prob: 0.020, requires_enhancer: true, load_requires_enhancer: false,
+         enhancers: [136, 147], enhancer_logic: additive,
+         initiation_prob: 0.35, pause_release_prob: 0.030, elongation_step_prob: 0.30, pause_offset: 1,
+         termination_prob: 0.02, termination_window: 10, pause_term_prob: 0.03, gene_class: celltype}
+      - {tss: 385, tes: 305, load_prob: 0.020, requires_enhancer: true, load_requires_enhancer: false,
+         enhancers: [391, 397], enhancer_logic: additive,  # reverse gene: upstream = right of TSS
+         initiation_prob: 0.30, pause_release_prob: 0.0015, elongation_step_prob: 0.25, pause_offset: 1,
+         termination_prob: 0.015, termination_window: 8, pause_term_prob: 0.02, gene_class: dev}
+      - {tss: 415, tes: 495, load_prob: 0.020, requires_enhancer: true, load_requires_enhancer: false,
+         enhancers: [404, 411], enhancer_logic: additive,
+         initiation_prob: 0.35, pause_release_prob: 0.030, elongation_step_prob: 0.30, pause_offset: 1,
+         termination_prob: 0.02, termination_window: 10, pause_term_prob: 0.03, gene_class: celltype}
+      - {tss: 590, tes: 530, load_prob: 0.028, requires_enhancer: false, load_requires_enhancer: false,
+         initiation_prob: 0.60, pause_release_prob: 0.070, elongation_step_prob: 0.42, pause_offset: 1,
+         termination_prob: 0.03, termination_window: 12, pause_term_prob: 0.03, gene_class: hk_const}
+
+  plugins:
+    topology:    ner_rnapii_3d.plugins.topology:gene_aware_convergent_tad_topology
+    load:        ner_rnapii_3d.plugins.lef_dynamics:load_targeted
+    unload_prob: ner_rnapii_3d.plugins.lef_dynamics:unload_prob
+    capture:     ner_rnapii_3d.plugins.lef_dynamics:capture
+    release:     ner_rnapii_3d.plugins.lef_dynamics:release
+    translocate: ner_rnapii_3d.plugins.lef_dynamics:translocate_with_rnapii
+    rnapii_load:        ner_rnapii_3d.plugins.rnapii:load_rnapii
+    rnapii_translocate: ner_rnapii_3d.plugins.rnapii:stateful_translocate_rnapii
+    lesion:      ner_rnapii_3d.plugins.lesions:update_lesions
